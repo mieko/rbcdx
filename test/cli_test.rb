@@ -132,8 +132,11 @@ class CliTest < Minitest::Test
     )
 
     assert_equal 0, status
-    assert_equal [{crawl_id: "CC-MAIN-2026-25", output_dir: "indexes", limit: nil, force: false}], client.download_requests
+    assert_equal [{crawl_id: "CC-MAIN-2026-25", output_dir: "indexes", limit: nil, force: false, zipnum: true}], client.download_requests
     assert_match(%r{indexes/CC-MAIN-2026-25/cdx-00000.gz}, out.string)
+    assert_match(%r{indexes/CC-MAIN-2026-25/cluster.idx}, out.string)
+    assert_match(/downloading \[1\/3\] cdx-00000\.gz/, err.string)
+    assert_match(/progress \[1\/3\] cdx-00000\.gz 64\.0 MiB \/ 128\.0 MiB \(50%\)/, err.string)
     assert_match(/downloaded/, err.string)
   end
 
@@ -147,7 +150,20 @@ class CliTest < Minitest::Test
     )
 
     assert_equal 0, status
-    assert_equal [{crawl_id: "CC-MAIN-2026-21", output_dir: "indexes", limit: 1, force: true}], client.download_requests
+    assert_equal [{crawl_id: "CC-MAIN-2026-21", output_dir: "indexes", limit: 1, force: true, zipnum: true}], client.download_requests
+  end
+
+  def test_data_download_can_skip_zipnum_lookup
+    client = FakeDataClient.new
+    status = CDX::CLI.start(
+      ["data", "download", "--output", "indexes", "--no-zipnum"],
+      out: StringIO.new,
+      err: StringIO.new,
+      data_client: client
+    )
+
+    assert_equal 0, status
+    assert_equal [{crawl_id: "CC-MAIN-2026-25", output_dir: "indexes", limit: nil, force: false, zipnum: false}], client.download_requests
   end
 
   def test_data_download_dry_run_does_not_require_output
@@ -162,8 +178,9 @@ class CliTest < Minitest::Test
 
     assert_equal 0, status
     assert_empty client.download_requests
-    assert_equal [{crawl_id: "CC-MAIN-2026-21", limit: 1}], client.index_requests
+    assert_equal [{crawl_id: "CC-MAIN-2026-21", limit: 1, zipnum: true}], client.index_requests
     assert_match(%r{https://data.commoncrawl.org/.*/cdx-00000.gz}, out.string)
+    assert_match(%r{https://data.commoncrawl.org/.*/cluster.idx}, out.string)
   end
 
   def test_data_download_dry_run_with_output_does_not_create_output_directory
@@ -272,17 +289,30 @@ class CliTest < Minitest::Test
       crawls.first
     end
 
-    def index_files(crawl_id, limit: nil)
-      @index_requests << {crawl_id: crawl_id, limit: limit}
-      files(crawl_id, limit: limit)
+    def index_files(crawl_id, limit: nil, zipnum: true)
+      @index_requests << {crawl_id: crawl_id, limit: limit, zipnum: zipnum}
+      files(crawl_id, limit: limit, zipnum: zipnum)
     end
 
-    def download_indexes(crawl_id:, output_dir:, limit: nil, force: nil)
-      @download_requests << {crawl_id: crawl_id, output_dir: output_dir, limit: limit, force: force}
-      files(crawl_id, limit: limit).map do |file|
+    def download_indexes(crawl_id:, output_dir:, limit: nil, force: nil, zipnum: true, progress: nil)
+      @download_requests << {crawl_id: crawl_id, output_dir: output_dir, limit: limit, force: force, zipnum: zipnum}
+      files = files(crawl_id, limit: limit, zipnum: zipnum)
+      files.map.with_index(1) do |file, index|
+        destination = file.destination(output_dir)
+        progress&.call(:start, file: file, destination: destination, index: index, total: files.length)
+        progress&.call(
+          :progress,
+          file: file,
+          destination: destination,
+          index: index,
+          total: files.length,
+          downloaded_bytes: 64 * 1024 * 1024,
+          total_bytes: 128 * 1024 * 1024
+        )
+        progress&.call(:finish, file: file, destination: destination, index: index, total: files.length)
         CDX::CommonCrawlData::DownloadResult.new(
           file,
-          file.destination(output_dir),
+          destination,
           :downloaded
         )
       end
@@ -290,7 +320,7 @@ class CliTest < Minitest::Test
 
     private
 
-    def files(crawl_id, limit: nil)
+    def files(crawl_id, limit: nil, zipnum: true)
       files = %w[cdx-00000.gz cdx-00001.gz].map do |filename|
         path = "cc-index/collections/#{crawl_id}/indexes/#{filename}"
         CDX::CommonCrawlData::IndexFile.new(
@@ -299,7 +329,11 @@ class CliTest < Minitest::Test
           "https://data.commoncrawl.org/#{path}"
         )
       end
-      limit ? files.first(limit) : files
+      files = files.first(limit) if limit
+      return files unless zipnum
+
+      path = "cc-index/collections/#{crawl_id}/indexes/cluster.idx"
+      files + [CDX::CommonCrawlData::IndexFile.new(crawl_id, path, "https://data.commoncrawl.org/#{path}")]
     end
   end
 end

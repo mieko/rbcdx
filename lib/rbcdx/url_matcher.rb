@@ -23,6 +23,25 @@ module CDX
       match_urlkey?(capture.urlkey.to_s)
     end
 
+    def index_key_range
+      index_key_ranges.first
+    end
+
+    def index_key_ranges
+      return domain_index_key_ranges if match == :domain
+
+      start_key = case match
+      when :host
+        "#{@domain_surt})"
+      when :exact
+        "#{@surt} "
+      else
+        @surt.to_s
+      end
+
+      [[start_key, prefix_successor(start_key)]]
+    end
+
     private
 
     def infer_match
@@ -86,6 +105,25 @@ module CDX
     def normalize_path(path)
       normalized = path.to_s
       normalized.empty? ? "/" : normalized
+    end
+
+    def domain_index_key_ranges
+      root_prefix = "#{@domain_surt})"
+      subdomain_prefix = "#{@domain_surt},"
+      [
+        [root_prefix, prefix_successor(root_prefix)],
+        [subdomain_prefix, prefix_successor(subdomain_prefix)]
+      ]
+    end
+
+    def prefix_successor(prefix)
+      bytes = prefix.b.bytes
+      index = bytes.length - 1
+      index -= 1 while index >= 0 && bytes[index] == 255
+      return if index.negative?
+
+      bytes[index] += 1
+      bytes[0..index].pack("C*")
     end
   end
 end

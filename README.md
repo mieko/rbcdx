@@ -43,9 +43,10 @@ gem "rbcdx", git: "https://github.com/mieko/rbcdx.git", ref: "COMMIT_SHA"
 | Glob or directory | `indexes/*.gz`, `indexes/CC-MAIN-2025-43` |
 
 It does not read WARC/WAT/WET content files, Common Crawl path-list files,
-Parquet/ORC URL indexes, or ZipNum metadata. Index records need `filename`,
-`offset`, and `length` fields if you want to fetch WARC records with HTTP range
-requests.
+or Parquet/ORC URL indexes. When a Common Crawl `cluster.idx` file is next to
+the `cdx-*.gz` shards, `rbcdx` uses it automatically for URL-pattern queries.
+Index records need `filename`, `offset`, and `length` fields if you want to
+fetch WARC records with HTTP range requests.
 
 ## Get Common Crawl Index Files
 
@@ -59,9 +60,11 @@ rbcdx data download --crawl CC-MAIN-2026-25 --output ./indexes
 ```
 
 `download` uses the latest crawl by default and writes files to
-`./indexes/<CRAWL_ID>/`. Existing files are skipped unless you pass `--force`.
-Use `--limit N` when you only want a small sample, and `--dry-run` to print the
-planned downloads without writing files.
+`./indexes/<CRAWL_ID>/`. It downloads the `cdx-*.gz` shards and `cluster.idx`
+lookup file, skipping existing files unless you pass `--force`. Use `--limit N`
+when you only want a small CDX sample, `--no-zipnum` to skip `cluster.idx`, and
+`--dry-run` to print the planned downloads without writing files. Downloaded
+paths are written to stdout; progress is written to stderr.
 
 ## Query Captures
 
@@ -184,7 +187,8 @@ Use `--format jsonl|text|csv` for capture output.
 
 ## Notes
 
-- `rbcdx` streams local index files. It does not use ZipNum block lookup files.
+- `rbcdx` streams local index files, using `cluster.idx` when present to avoid
+  scanning unrelated CDX blocks for URL-pattern queries.
 - It builds WARC object URLs and range headers; it does not parse WARC records.
 - Inspired by Common Crawl's [`cdx_toolkit`](https://github.com/commoncrawl/cdx_toolkit).
 

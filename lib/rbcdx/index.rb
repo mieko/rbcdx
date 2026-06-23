@@ -1,3 +1,4 @@
+require "stringio"
 require "zlib"
 
 module CDX
@@ -20,6 +21,7 @@ module CDX
       raise ArgumentError, "no local CDX/CDXJ paths were provided" if @paths.empty?
 
       @parser_factory = parser || -> { Parser.new }
+      @zipnum_indexes = ZipNumIndex.find_all(@paths)
     end
 
     def each
@@ -69,7 +71,7 @@ module CDX
       end
 
       yielded = 0
-      each_capture do |capture|
+      each_capture(matcher: matcher) do |capture|
         next unless capture_matches?(capture, matcher, checks, from, to)
 
         yielder << project(capture, fields)
@@ -80,7 +82,7 @@ module CDX
 
     def matching_captures(matcher, checks, from, to)
       matches = []
-      each_capture do |capture|
+      each_capture(matcher: matcher) do |capture|
         matches << capture if capture_matches?(capture, matcher, checks, from, to)
       end
       matches
@@ -138,11 +140,30 @@ module CDX
       checks.all? { |check| check.call(capture) }
     end
 
-    def each_capture
+    def each_capture(matcher: nil)
+      if matcher && @zipnum_indexes.any?
+        zipnum_by_path = @zipnum_indexes.each_with_object({}) do |index, indexes|
+          index.paths.each { |path| indexes[path] = index }
+        end
+        paths.each do |path|
+          if (index = zipnum_by_path[path])
+            index.captures_for(matcher, parser_factory: @parser_factory, path: path) { |capture| yield capture }
+          else
+            each_capture_from_paths([path]) { |capture| yield capture }
+          end
+        end
+      else
+        each_capture_from_paths(paths) { |capture| yield capture }
+      end
+    end
+
+    def each_capture_from_paths(paths)
       paths.each do |path|
         parser = @parser_factory.call
+        line_number = 0
         open_path(path) do |io|
-          io.each_line.with_index(1) do |line, line_number|
+          io.each_line do |line|
+            line_number += 1
             data = parser.parse(line)
             next unless data
 
@@ -154,9 +175,21 @@ module CDX
 
     def open_path(path)
       if path.end_with?(".gz")
-        Zlib::GzipReader.open(path) { |gzip| yield gzip }
+        open_gzip_path(path) { |gzip| yield gzip }
       else
         File.open(path, "r:utf-8") { |file| yield file }
+      end
+    end
+
+    def open_gzip_path(path)
+      File.open(path, "rb") do |file|
+        unused = nil
+        until file.eof? && unused.to_s.empty?
+          gzip = Zlib::GzipReader.new(PrependedIO.new(unused, file))
+          yield gzip
+          unused = gzip.unused
+          gzip.finish
+        end
       end
     end
 
@@ -211,6 +244,45 @@ module CDX
 
     def index_file?(path)
       File.basename(path).match?(INDEX_FILE_PATTERN)
+    end
+
+    class PrependedIO
+      def initialize(prefix, io)
+        @prefix = StringIO.new(prefix.to_s)
+        @io = io
+      end
+
+      def read(length = nil, outbuf = nil)
+        data = length ? read_length(length) : @prefix.read.to_s + @io.read.to_s
+        outbuf.replace(data) if outbuf && data
+        data
+      end
+
+      def readpartial(length, outbuf = nil)
+        data = read(length)
+        raise EOFError unless data
+
+        outbuf&.replace(data)
+        data
+      end
+
+      def eof?
+        @prefix.eof? && @io.eof?
+      end
+
+      private
+
+      def read_length(length)
+        data = +""
+        while data.bytesize < length
+          source = @prefix.eof? ? @io : @prefix
+          chunk = source.read(length - data.bytesize)
+          break unless chunk
+
+          data << chunk
+        end
+        data.empty? ? nil : data
+      end
     end
   end
 end

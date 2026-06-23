@@ -59,31 +59,47 @@ module CDX
       crawls.first || raise(Error, "Common Crawl crawl list is empty")
     end
 
-    def index_files(crawl_id, limit: nil)
-      files = parse_index_paths(crawl_id, fetch(index_paths_url(crawl_id))).map do |path|
+    def index_files(crawl_id, limit: nil, zipnum: true)
+      parse_index_paths(crawl_id, fetch(index_paths_url(crawl_id)), limit: limit, zipnum: zipnum).map do |path|
         IndexFile.new(crawl_id, path, index_file_url(path))
       end
-      limit ? files.first(limit) : files
     end
 
-    def download_indexes(crawl_id:, output_dir:, limit: nil, force: false)
-      index_files(crawl_id, limit: limit).map do |file|
+    def download_indexes(crawl_id:, output_dir:, limit: nil, force: false, zipnum: true, progress: nil)
+      files = index_files(crawl_id, limit: limit, zipnum: zipnum)
+      files.map.with_index(1) do |file, index|
         destination = file.destination(output_dir)
         if File.exist?(destination) && !force
+          emit_progress(progress, :skip, file: file, destination: destination, index: index, total: files.length)
           DownloadResult.new(file, destination, :skipped)
         else
-          download_to_destination(file.url, destination)
+          emit_progress(progress, :start, file: file, destination: destination, index: index, total: files.length)
+          download_to_destination(file.url, destination) do |downloaded_bytes:, total_bytes:|
+            emit_progress(
+              progress,
+              :progress,
+              file: file,
+              destination: destination,
+              index: index,
+              total: files.length,
+              downloaded_bytes: downloaded_bytes,
+              total_bytes: total_bytes
+            )
+          end
+          emit_progress(progress, :finish, file: file, destination: destination, index: index, total: files.length)
           DownloadResult.new(file, destination, :downloaded)
         end
       end
     end
 
-    def parse_index_paths(crawl_id, gzipped_paths)
-      Zlib::GzipReader.wrap(StringIO.new(gzipped_paths)) do |gzip|
-        gzip.each_line.map(&:strip).select do |path|
-          index_path?(crawl_id, path)
-        end
-      end
+    def parse_index_paths(crawl_id, gzipped_paths, limit: nil, zipnum: true)
+      paths = Zlib::GzipReader.wrap(StringIO.new(gzipped_paths)) { |gzip| gzip.each_line.map(&:strip) }
+      cdx_paths = paths.select { |path| cdx_path?(crawl_id, path) }
+      cdx_paths = cdx_paths.first(limit) if limit
+
+      return cdx_paths if cdx_paths.empty? || !zipnum
+
+      cdx_paths + paths.select { |path| zipnum_path?(crawl_id, path) }
     rescue Zlib::GzipFile::Error => error
       raise Error, "failed to read Common Crawl index file list: #{error.message}"
     end
@@ -114,22 +130,29 @@ module CDX
       body
     end
 
-    def download_url(url, destination)
+    def download_url(url, destination, progress: nil)
       http_get(url, "download") do |response|
+        total_bytes = response["content-length"]&.to_i
+        downloaded_bytes = 0
+        progress&.call(downloaded_bytes: downloaded_bytes, total_bytes: total_bytes)
         File.open(destination, "wb") do |output|
-          response.read_body { |chunk| output.write(chunk) }
+          response.read_body do |chunk|
+            output.write(chunk)
+            downloaded_bytes += chunk.bytesize
+            progress&.call(downloaded_bytes: downloaded_bytes, total_bytes: total_bytes)
+          end
         end
       end
     end
 
-    def download_to_destination(url, destination)
+    def download_to_destination(url, destination, &progress)
       FileUtils.mkdir_p(File.dirname(destination))
 
       tempfile = Tempfile.new(["#{File.basename(destination)}.", ".tmp"], File.dirname(destination))
       temp_path = tempfile.path
       tempfile.close
 
-      @downloader.call(url, temp_path)
+      call_downloader(url, temp_path, progress)
       File.rename(temp_path, destination)
     rescue Error
       raise
@@ -137,6 +160,27 @@ module CDX
       raise Error, "failed to download #{url}: #{error.message}"
     ensure
       tempfile&.close!
+    end
+
+    def call_downloader(url, destination, progress)
+      parameters = downloader_parameters
+      if parameters.any? { |kind, name| %i[key keyreq].include?(kind) && name == :progress } ||
+          parameters.any? { |kind, _name| kind == :keyrest }
+        @downloader.call(url, destination, progress: progress)
+      else
+        @downloader.call(url, destination)
+      end
+    end
+
+    def downloader_parameters
+      return @downloader.parameters if @downloader.respond_to?(:parameters)
+      return @downloader.method(:call).parameters if @downloader.respond_to?(:call)
+
+      []
+    end
+
+    def emit_progress(progress, event, **payload)
+      progress&.call(event, **payload)
     end
 
     def http_get(url, action)
@@ -157,8 +201,12 @@ module CDX
       raise Error, "failed to #{action} #{url}: #{error.message}"
     end
 
-    def index_path?(crawl_id, path)
+    def cdx_path?(crawl_id, path)
       path.match?(%r{\Acc-index/collections/#{Regexp.escape(crawl_id)}/indexes/cdx-\d+\.gz\z})
+    end
+
+    def zipnum_path?(crawl_id, path)
+      path == "cc-index/collections/#{crawl_id}/indexes/cluster.idx"
     end
   end
 end

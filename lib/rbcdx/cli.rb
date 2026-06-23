@@ -130,7 +130,7 @@ module CDX
       crawl_id = selected_crawl_id(options)
 
       if options[:dry_run]
-        @data_client.index_files(crawl_id, limit: options[:limit]).each do |file|
+        @data_client.index_files(crawl_id, limit: options[:limit], zipnum: options.fetch(:zipnum, true)).each do |file|
           if options[:output]
             @out.puts "#{file.url} -> #{file.destination(options[:output])}"
           else
@@ -144,10 +144,11 @@ module CDX
         crawl_id: crawl_id,
         output_dir: options.fetch(:output),
         limit: options[:limit],
-        force: options.fetch(:force, false)
+        force: options.fetch(:force, false),
+        zipnum: options.fetch(:zipnum, true),
+        progress: DownloadProgress.new(@err)
       ).each do |result|
         @out.puts result.destination
-        @err.puts "#{result.status} #{result.destination}"
       end
       0
     end
@@ -241,7 +242,7 @@ module CDX
         opts.on("--output DIR", "Directory to write index files") do |output|
           options[:output] = output
         end
-        opts.on("--limit N", Integer, "Download only the first N index files") do |limit|
+        opts.on("--limit N", Integer, "Download only the first N CDX shards") do |limit|
           options[:limit] = limit
         end
         opts.on("--force", "Overwrite existing files") do
@@ -249,6 +250,9 @@ module CDX
         end
         opts.on("--dry-run", "Print planned downloads without writing files") do
           options[:dry_run] = true
+        end
+        opts.on("--[no-]zipnum", "Download ZipNum lookup data") do |zipnum|
+          options[:zipnum] = zipnum
         end
       end
 
@@ -340,7 +344,7 @@ module CDX
       <<~USAGE
         Usage:
           rbcdx data list [--limit N] [--format text|jsonl]
-          rbcdx data download --output DIR [--crawl CRAWL] [--limit N] [--dry-run]
+          rbcdx data download --output DIR [--crawl CRAWL] [--limit N] [--dry-run] [--no-zipnum]
 
         Commands:
           list      List available Common Crawl crawls
@@ -358,8 +362,52 @@ module CDX
     def data_download_usage
       <<~USAGE
         Usage:
-          rbcdx data download --output DIR [--crawl CRAWL] [--limit N] [--dry-run]
+          rbcdx data download --output DIR [--crawl CRAWL] [--limit N] [--dry-run] [--no-zipnum]
       USAGE
+    end
+
+    class DownloadProgress
+      REPORT_INTERVAL_BYTES = 64 * 1024 * 1024
+
+      def initialize(io)
+        @io = io
+        @last_reported_bytes = {}
+      end
+
+      def call(event, file:, destination:, index:, total:, downloaded_bytes: nil, total_bytes: nil)
+        case event
+        when :start
+          @last_reported_bytes[destination] = 0
+          @io.puts "downloading [#{index}/#{total}] #{file.filename}"
+        when :progress
+          report_progress(file, destination, index, total, downloaded_bytes, total_bytes)
+        when :finish
+          @io.puts "downloaded [#{index}/#{total}] #{file.filename} -> #{destination}"
+        when :skip
+          @io.puts "skipped [#{index}/#{total}] #{file.filename} -> #{destination}"
+        end
+      end
+
+      private
+
+      def report_progress(file, destination, index, total, downloaded_bytes, total_bytes)
+        return unless downloaded_bytes
+
+        last_reported = @last_reported_bytes.fetch(destination, 0)
+        return if downloaded_bytes - last_reported < REPORT_INTERVAL_BYTES
+
+        @last_reported_bytes[destination] = downloaded_bytes
+        if total_bytes&.positive?
+          percent = (downloaded_bytes * 100 / total_bytes)
+          @io.puts "progress [#{index}/#{total}] #{file.filename} #{format_bytes(downloaded_bytes)} / #{format_bytes(total_bytes)} (#{percent}%)"
+        else
+          @io.puts "progress [#{index}/#{total}] #{file.filename} #{format_bytes(downloaded_bytes)}"
+        end
+      end
+
+      def format_bytes(bytes)
+        format("%.1f MiB", bytes / 1024.0 / 1024)
+      end
     end
   end
 end
