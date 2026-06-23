@@ -47,30 +47,21 @@ Parquet/ORC URL indexes, or ZipNum metadata. Index records need `filename`,
 `offset`, and `length` fields if you want to fetch WARC records with HTTP range
 requests.
 
-## Getting Common Crawl CDXJ Shards
+## Get Common Crawl Index Files
 
-Pick a crawl id from `https://index.commoncrawl.org/collinfo.json` or
-`https://data.commoncrawl.org/cc-index/collections/index.html`. Each crawl has
-a path list at:
-
-```text
-https://data.commoncrawl.org/crawl-data/CC-MAIN-YYYY-WW/cc-index.paths.gz
-```
-
-Download the shards you want by prefixing each listed path with
-`https://data.commoncrawl.org/`:
+Use `rbcdx data` to list available Common Crawl crawls and download local index
+files:
 
 ```sh
-mkdir -p indexes/CC-MAIN-YYYY-WW
-
-curl -fsSL https://data.commoncrawl.org/crawl-data/CC-MAIN-YYYY-WW/cc-index.paths.gz |
-  gzip -dc |
-  head -10 |
-  while read -r path; do
-    curl -fL "https://data.commoncrawl.org/$path" \
-      -o "indexes/CC-MAIN-YYYY-WW/$(basename "$path")"
-  done
+rbcdx data list
+rbcdx data download --output ./indexes
+rbcdx data download --crawl CC-MAIN-2026-25 --output ./indexes
 ```
+
+`download` uses the latest crawl by default and writes files to
+`./indexes/<CRAWL_ID>/`. Existing files are skipped unless you pass `--force`.
+Use `--limit N` when you only want a small sample, and `--dry-run` to print the
+planned downloads without writing files.
 
 ## Query Captures
 
@@ -183,6 +174,8 @@ Excon.get(request.url, headers: request.headers)
 ## CLI
 
 ```sh
+rbcdx data list
+rbcdx data download --output './indexes'
 rbcdx captures --index './indexes' --limit 10 'commoncrawl.org/*'
 rbcdx count --index './indexes' 'commoncrawl.org/*'
 ```

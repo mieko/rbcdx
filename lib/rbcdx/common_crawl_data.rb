@@ -1,0 +1,164 @@
+require "fileutils"
+require "json"
+require "net/http"
+require "stringio"
+require "tempfile"
+require "uri"
+require "zlib"
+
+module CDX
+  class CommonCrawlData
+    CRAWL_LIST_URL = "https://index.commoncrawl.org/collinfo.json"
+    DATA_BASE_URL = "https://data.commoncrawl.org"
+
+    Crawl = Struct.new(:id, :name, :from, :to) do
+      def to_h
+        {
+          "id" => id,
+          "name" => name,
+          "from" => from,
+          "to" => to
+        }
+      end
+    end
+
+    IndexFile = Struct.new(:crawl_id, :path, :url) do
+      def filename
+        File.basename(path)
+      end
+
+      def destination(output_dir)
+        File.join(output_dir, crawl_id, filename)
+      end
+
+      def to_h
+        {
+          "crawl" => crawl_id,
+          "path" => path,
+          "url" => url
+        }
+      end
+    end
+
+    DownloadResult = Struct.new(:file, :destination, :status)
+
+    def initialize(fetcher: nil, downloader: nil)
+      @fetcher = fetcher || method(:fetch_url)
+      @downloader = downloader || method(:download_url)
+    end
+
+    def crawls
+      JSON.parse(fetch(CRAWL_LIST_URL)).map do |entry|
+        Crawl.new(entry.fetch("id"), entry["name"], entry["from"], entry["to"])
+      end
+    rescue JSON::ParserError => error
+      raise Error, "failed to parse Common Crawl crawl list: #{error.message}"
+    end
+
+    def latest_crawl
+      crawls.first || raise(Error, "Common Crawl crawl list is empty")
+    end
+
+    def index_files(crawl_id, limit: nil)
+      files = parse_index_paths(crawl_id, fetch(index_paths_url(crawl_id))).map do |path|
+        IndexFile.new(crawl_id, path, index_file_url(path))
+      end
+      limit ? files.first(limit) : files
+    end
+
+    def download_indexes(crawl_id:, output_dir:, limit: nil, force: false)
+      index_files(crawl_id, limit: limit).map do |file|
+        destination = file.destination(output_dir)
+        if File.exist?(destination) && !force
+          DownloadResult.new(file, destination, :skipped)
+        else
+          download_to_destination(file.url, destination)
+          DownloadResult.new(file, destination, :downloaded)
+        end
+      end
+    end
+
+    def parse_index_paths(crawl_id, gzipped_paths)
+      Zlib::GzipReader.wrap(StringIO.new(gzipped_paths)) do |gzip|
+        gzip.each_line.map(&:strip).select do |path|
+          index_path?(crawl_id, path)
+        end
+      end
+    rescue Zlib::GzipFile::Error => error
+      raise Error, "failed to read Common Crawl index file list: #{error.message}"
+    end
+
+    def index_paths_url(crawl_id)
+      "#{DATA_BASE_URL}/crawl-data/#{crawl_id}/cc-index.paths.gz"
+    end
+
+    def index_file_url(path)
+      "#{DATA_BASE_URL}/#{path}"
+    end
+
+    private
+
+    def fetch(url)
+      @fetcher.call(url)
+    rescue Error
+      raise
+    rescue => error
+      raise Error, "failed to fetch #{url}: #{error.message}"
+    end
+
+    def fetch_url(url)
+      body = +""
+      http_get(url, "fetch") do |response|
+        response.read_body { |chunk| body << chunk }
+      end
+      body
+    end
+
+    def download_url(url, destination)
+      http_get(url, "download") do |response|
+        File.open(destination, "wb") do |output|
+          response.read_body { |chunk| output.write(chunk) }
+        end
+      end
+    end
+
+    def download_to_destination(url, destination)
+      FileUtils.mkdir_p(File.dirname(destination))
+
+      tempfile = Tempfile.new(["#{File.basename(destination)}.", ".tmp"], File.dirname(destination))
+      temp_path = tempfile.path
+      tempfile.close
+
+      @downloader.call(url, temp_path)
+      File.rename(temp_path, destination)
+    rescue Error
+      raise
+    rescue => error
+      raise Error, "failed to download #{url}: #{error.message}"
+    ensure
+      tempfile&.close!
+    end
+
+    def http_get(url, action)
+      uri = URI(url)
+      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https") do |http|
+        request = Net::HTTP::Get.new(uri)
+        http.request(request) do |response|
+          unless response.is_a?(Net::HTTPSuccess)
+            raise Error, "failed to #{action} #{url}: HTTP #{response.code}"
+          end
+
+          yield response
+        end
+      end
+    rescue Error
+      raise
+    rescue => error
+      raise Error, "failed to #{action} #{url}: #{error.message}"
+    end
+
+    def index_path?(crawl_id, path)
+      path.match?(%r{\Acc-index/collections/#{Regexp.escape(crawl_id)}/indexes/cdx-\d+\.gz\z})
+    end
+  end
+end

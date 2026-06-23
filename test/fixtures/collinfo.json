@@ -1,0 +1,18 @@
+[
+  {
+    "id": "CC-MAIN-2026-25",
+    "name": "June 2026 Index",
+    "timegate": "https://index.commoncrawl.org/CC-MAIN-2026-25/",
+    "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2026-25-index",
+    "from": "2026-06-05T21:48:11",
+    "to": "2026-06-18T19:32:05"
+  },
+  {
+    "id": "CC-MAIN-2026-21",
+    "name": "May 2026 Index",
+    "timegate": "https://index.commoncrawl.org/CC-MAIN-2026-21/",
+    "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2026-21-index",
+    "from": "2026-05-10T00:00:00",
+    "to": "2026-05-23T23:59:59"
+  }
+]

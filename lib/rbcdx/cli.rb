@@ -5,18 +5,20 @@ require "optparse"
 module CDX
   class CLI
     FORMATS = %w[jsonl text csv].freeze
+    DATA_FORMATS = %w[text jsonl].freeze
 
-    def self.start(argv = ARGV, out: $stdout, err: $stderr)
-      new(argv.dup, out: out, err: err).run
+    def self.start(argv = ARGV, out: $stdout, err: $stderr, data_client: nil)
+      new(argv.dup, out: out, err: err, data_client: data_client).run
     rescue ArgumentError, Error, OptionParser::ParseError => error
       err.puts "rbcdx: #{error.message}"
       1
     end
 
-    def initialize(argv, out:, err:)
+    def initialize(argv, out:, err:, data_client: nil)
       @argv = argv
       @out = out
       @err = err
+      @data_client = data_client || CommonCrawlData.new
     end
 
     def run
@@ -27,6 +29,8 @@ module CDX
         run_captures
       when "count"
         run_count
+      when "data"
+        run_data
       when "--version", "-v"
         @out.puts CDX::VERSION
         0
@@ -82,6 +86,72 @@ module CDX
       0
     end
 
+    def run_data
+      command = @argv.shift
+
+      case command
+      when "list"
+        run_data_list
+      when "download"
+        run_data_download
+      when "help", "--help", "-h", nil
+        @out.puts data_usage
+        0
+      else
+        raise ArgumentError, "unknown data command #{command.inspect}\n\n#{data_usage}"
+      end
+    end
+
+    def run_data_list
+      options = parse_data_list_options
+      return show_help(options) if options[:help]
+
+      ensure_no_arguments!
+      crawls = @data_client.crawls.first(options[:limit])
+      crawls.each do |crawl|
+        case options[:format]
+        when "text"
+          @out.puts [crawl.id, crawl.name, "#{crawl.from}..#{crawl.to}"].compact.join("  ")
+        when "jsonl"
+          @out.puts JSON.generate(crawl.to_h)
+        else
+          raise ArgumentError, "unsupported format #{options[:format].inspect}"
+        end
+      end
+      0
+    end
+
+    def run_data_download
+      options = parse_data_download_options
+      return show_help(options) if options[:help]
+
+      ensure_no_arguments!
+      validate_data_download_options(options)
+      crawl_id = selected_crawl_id(options)
+
+      if options[:dry_run]
+        @data_client.index_files(crawl_id, limit: options[:limit]).each do |file|
+          if options[:output]
+            @out.puts "#{file.url} -> #{file.destination(options[:output])}"
+          else
+            @out.puts file.url
+          end
+        end
+        return 0
+      end
+
+      @data_client.download_indexes(
+        crawl_id: crawl_id,
+        output_dir: options.fetch(:output),
+        limit: options[:limit],
+        force: options.fetch(:force, false)
+      ).each do |result|
+        @out.puts result.destination
+        @err.puts "#{result.status} #{result.destination}"
+      end
+      0
+    end
+
     def parse_options
       options = {
         indexes: [],
@@ -130,6 +200,63 @@ module CDX
       options
     end
 
+    def parse_data_list_options
+      options = {
+        format: "text",
+        limit: 10
+      }
+
+      parser = OptionParser.new do |opts|
+        opts.banner = data_list_usage
+        opts.on("-h", "--help", "Show help") do
+          options[:help] = opts
+        end
+        opts.on("--limit N", Integer, "Maximum crawls to list") do |limit|
+          options[:limit] = limit
+        end
+        opts.on("--format FORMAT", DATA_FORMATS, "text or jsonl") do |format|
+          options[:format] = format
+        end
+      end
+
+      parser.order!(@argv)
+      validate_positive_integer!(options[:limit], "--limit")
+      options
+    end
+
+    def parse_data_download_options
+      options = {}
+
+      parser = OptionParser.new do |opts|
+        opts.banner = data_download_usage
+        opts.on("-h", "--help", "Show help") do
+          options[:help] = opts
+        end
+        opts.on("--crawl CRAWL", "Common Crawl crawl id") do |crawl|
+          options[:crawl] = crawl
+        end
+        opts.on("--latest", "Use the latest crawl") do
+          options[:latest] = true
+        end
+        opts.on("--output DIR", "Directory to write index files") do |output|
+          options[:output] = output
+        end
+        opts.on("--limit N", Integer, "Download only the first N index files") do |limit|
+          options[:limit] = limit
+        end
+        opts.on("--force", "Overwrite existing files") do
+          options[:force] = true
+        end
+        opts.on("--dry-run", "Print planned downloads without writing files") do
+          options[:dry_run] = true
+        end
+      end
+
+      parser.order!(@argv)
+      validate_positive_integer!(options[:limit], "--limit") if options[:limit]
+      options
+    end
+
     def show_help(options)
       @out.puts options[:help]
       0
@@ -144,6 +271,12 @@ module CDX
       end
 
       url
+    end
+
+    def ensure_no_arguments!
+      return if @argv.empty?
+
+      raise ArgumentError, "unexpected arguments: #{@argv.join(" ")}"
     end
 
     def build_index(options)
@@ -170,13 +303,62 @@ module CDX
       fields.split(",").map(&:strip).reject(&:empty?)
     end
 
+    def validate_data_download_options(options)
+      if options[:crawl] && options[:latest]
+        raise ArgumentError, "choose --crawl or --latest, not both"
+      end
+
+      return if options[:dry_run]
+      return if options[:output]
+
+      raise ArgumentError, "provide --output DIR"
+    end
+
+    def selected_crawl_id(options)
+      return options[:crawl] if options[:crawl]
+
+      @data_client.latest_crawl.id
+    end
+
+    def validate_positive_integer!(value, option)
+      raise ArgumentError, "#{option} must be greater than 0" unless value.positive?
+    end
+
     def usage
       <<~USAGE
         Usage:
           rbcdx captures --index PATH [--limit N] [--filter '=status:200'] URL
           rbcdx count --index PATH URL
+          rbcdx data list [--limit N]
+          rbcdx data download --output DIR [--crawl CRAWL]
 
         PATH may be a CDX/CDXJ file, a .gz file, a glob, or a directory.
+      USAGE
+    end
+
+    def data_usage
+      <<~USAGE
+        Usage:
+          rbcdx data list [--limit N] [--format text|jsonl]
+          rbcdx data download --output DIR [--crawl CRAWL] [--limit N] [--dry-run]
+
+        Commands:
+          list      List available Common Crawl crawls
+          download  Download Common Crawl index files
+      USAGE
+    end
+
+    def data_list_usage
+      <<~USAGE
+        Usage:
+          rbcdx data list [--limit N] [--format text|jsonl]
+      USAGE
+    end
+
+    def data_download_usage
+      <<~USAGE
+        Usage:
+          rbcdx data download --output DIR [--crawl CRAWL] [--limit N] [--dry-run]
       USAGE
     end
   end

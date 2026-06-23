@@ -96,4 +96,210 @@ class CliTest < Minitest::Test
     assert_match(/--index PATH/, out.string)
     assert_empty err.string
   end
+
+  def test_data_list_outputs_crawls
+    out = StringIO.new
+    status = CDX::CLI.start(["data", "list"], out: out, err: StringIO.new, data_client: FakeDataClient.new)
+
+    assert_equal 0, status
+    assert_match(/CC-MAIN-2026-25/, out.string)
+    assert_match(/June 2026 Index/, out.string)
+  end
+
+  def test_data_list_outputs_jsonl
+    out = StringIO.new
+    status = CDX::CLI.start(
+      ["data", "list", "--format", "jsonl", "--limit", "1"],
+      out: out,
+      err: StringIO.new,
+      data_client: FakeDataClient.new
+    )
+
+    assert_equal 0, status
+    lines = out.string.lines.map { |line| JSON.parse(line) }
+    assert_equal ["CC-MAIN-2026-25"], lines.map { |line| line["id"] }
+  end
+
+  def test_data_download_defaults_to_latest_and_all_files
+    client = FakeDataClient.new
+    out = StringIO.new
+    err = StringIO.new
+    status = CDX::CLI.start(
+      ["data", "download", "--output", "indexes"],
+      out: out,
+      err: err,
+      data_client: client
+    )
+
+    assert_equal 0, status
+    assert_equal [{crawl_id: "CC-MAIN-2026-25", output_dir: "indexes", limit: nil, force: false}], client.download_requests
+    assert_match(%r{indexes/CC-MAIN-2026-25/cdx-00000.gz}, out.string)
+    assert_match(/downloaded/, err.string)
+  end
+
+  def test_data_download_accepts_crawl_override_limit_and_force
+    client = FakeDataClient.new
+    status = CDX::CLI.start(
+      ["data", "download", "--crawl", "CC-MAIN-2026-21", "--output", "indexes", "--limit", "1", "--force"],
+      out: StringIO.new,
+      err: StringIO.new,
+      data_client: client
+    )
+
+    assert_equal 0, status
+    assert_equal [{crawl_id: "CC-MAIN-2026-21", output_dir: "indexes", limit: 1, force: true}], client.download_requests
+  end
+
+  def test_data_download_dry_run_does_not_require_output
+    client = FakeDataClient.new
+    out = StringIO.new
+    status = CDX::CLI.start(
+      ["data", "download", "--crawl", "CC-MAIN-2026-21", "--limit", "1", "--dry-run"],
+      out: out,
+      err: StringIO.new,
+      data_client: client
+    )
+
+    assert_equal 0, status
+    assert_empty client.download_requests
+    assert_equal [{crawl_id: "CC-MAIN-2026-21", limit: 1}], client.index_requests
+    assert_match(%r{https://data.commoncrawl.org/.*/cdx-00000.gz}, out.string)
+  end
+
+  def test_data_download_dry_run_with_output_does_not_create_output_directory
+    Dir.mktmpdir do |dir|
+      client = FakeDataClient.new
+      out = StringIO.new
+      output_dir = File.join(dir, "indexes")
+      status = CDX::CLI.start(
+        ["data", "download", "--output", output_dir, "--dry-run"],
+        out: out,
+        err: StringIO.new,
+        data_client: client
+      )
+
+      assert_equal 0, status
+      refute Dir.exist?(output_dir)
+      assert_empty client.download_requests
+      assert_match(%r{https://data.commoncrawl.org/.*/cdx-00000.gz -> #{Regexp.escape(output_dir)}}, out.string)
+    end
+  end
+
+  def test_data_download_requires_output_for_real_download
+    err = StringIO.new
+    status = CDX::CLI.start(
+      ["data", "download"],
+      out: StringIO.new,
+      err: err,
+      data_client: FakeDataClient.new
+    )
+
+    assert_equal 1, status
+    assert_match(/provide --output DIR/, err.string)
+  end
+
+  def test_data_download_rejects_crawl_and_latest_together
+    err = StringIO.new
+    status = CDX::CLI.start(
+      ["data", "download", "--crawl", "CC-MAIN-2026-25", "--latest", "--output", "indexes"],
+      out: StringIO.new,
+      err: err,
+      data_client: FakeDataClient.new
+    )
+
+    assert_equal 1, status
+    assert_match(/choose --crawl or --latest/, err.string)
+  end
+
+  def test_data_help_uses_configured_output
+    out = StringIO.new
+    err = StringIO.new
+    status = CDX::CLI.start(["data", "--help"], out: out, err: err, data_client: FakeDataClient.new)
+
+    assert_equal 0, status
+    assert_match(/rbcdx data list/, out.string)
+    assert_match(/Commands:/, out.string)
+    assert_match(/download  Download Common Crawl index files/, out.string)
+    assert_empty err.string
+  end
+
+  def test_data_subcommand_help_uses_configured_output
+    out = StringIO.new
+    err = StringIO.new
+    status = CDX::CLI.start(["data", "download", "--help"], out: out, err: err, data_client: FakeDataClient.new)
+
+    assert_equal 0, status
+    assert_match(/--output DIR/, out.string)
+    assert_empty err.string
+  end
+
+  def test_data_list_help_uses_configured_output
+    out = StringIO.new
+    err = StringIO.new
+    status = CDX::CLI.start(["data", "list", "--help"], out: out, err: err, data_client: FakeDataClient.new)
+
+    assert_equal 0, status
+    assert_match(/--format text\|jsonl/, out.string)
+    assert_empty err.string
+  end
+
+  class FakeDataClient
+    attr_reader :download_requests, :index_requests
+
+    def initialize
+      @download_requests = []
+      @index_requests = []
+    end
+
+    def crawls
+      [
+        CDX::CommonCrawlData::Crawl.new(
+          "CC-MAIN-2026-25",
+          "June 2026 Index",
+          "2026-06-05T21:48:11",
+          "2026-06-18T19:32:05"
+        ),
+        CDX::CommonCrawlData::Crawl.new(
+          "CC-MAIN-2026-21",
+          "May 2026 Index",
+          "2026-05-01T00:00:00",
+          "2026-05-14T00:00:00"
+        )
+      ]
+    end
+
+    def latest_crawl
+      crawls.first
+    end
+
+    def index_files(crawl_id, limit: nil)
+      @index_requests << {crawl_id: crawl_id, limit: limit}
+      files(crawl_id, limit: limit)
+    end
+
+    def download_indexes(crawl_id:, output_dir:, limit: nil, force: nil)
+      @download_requests << {crawl_id: crawl_id, output_dir: output_dir, limit: limit, force: force}
+      files(crawl_id, limit: limit).map do |file|
+        CDX::CommonCrawlData::DownloadResult.new(
+          file,
+          file.destination(output_dir),
+          :downloaded
+        )
+      end
+    end
+
+    private
+
+    def files(crawl_id, limit: nil)
+      files = %w[cdx-00000.gz cdx-00001.gz].map do |filename|
+        path = "cc-index/collections/#{crawl_id}/indexes/#{filename}"
+        CDX::CommonCrawlData::IndexFile.new(
+          crawl_id,
+          path,
+          "https://data.commoncrawl.org/#{path}"
+        )
+      end
+      limit ? files.first(limit) : files
+    end
+  end
 end
