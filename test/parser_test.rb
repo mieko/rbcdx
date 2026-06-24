@@ -2,7 +2,7 @@ require_relative "test_helper"
 
 class ParserTest < Minitest::Test
   def test_parses_raw_cdxj_lines
-    parser = CDX::Parser.new
+    parser = CDX::Backends::CDXJ::Parser.new
     data = parser.parse('org,example)/ 20250101000000 {"url":"https://example.org/","status":"200"}')
 
     assert_equal "org,example)/", data["urlkey"]
@@ -11,7 +11,7 @@ class ParserTest < Minitest::Test
   end
 
   def test_parses_json_object_lines
-    parser = CDX::Parser.new
+    parser = CDX::Backends::CDXJ::Parser.new
     data = parser.parse('{"urlkey":"org,example)/","timestamp":"20250101000000","url":"https://example.org/"}')
 
     assert_equal "org,example)/", data["urlkey"]
@@ -19,7 +19,7 @@ class ParserTest < Minitest::Test
   end
 
   def test_parses_cdx11_rows_after_header
-    parser = CDX::Parser.new
+    parser = CDX::Backends::CDXJ::Parser.new
     assert_nil parser.parse(" CDX N b a m s k r M S V g")
 
     data = parser.parse("org,example)/ 20200101000000 https://example.org/ text/html 200 DIG - - 123 456 crawl-data/example.warc.gz")

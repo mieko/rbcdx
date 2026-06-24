@@ -97,15 +97,27 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "cdx-00000.rbcdx")
       Zlib::GzipWriter.open(input) { |gzip| gzip.write(sorted_cdxj) }
 
-      CDX::Backends::Rbcdx.write(input, output, block_bytes: 180)
+      CDX::Backends::RbCDX.write(input, output, block_bytes: 180)
 
       assert_equal ["https://example.com/about"], CDX::Index.open(output).captures("example.com/about").map(&:url)
     end
   end
 
+  def test_rbcdx_backend_write_always_writes_rbcdx
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.data")
+      File.write(input, sorted_cdxj)
+
+      CDX::Backends::RbCDX.write(input, output, output_format: "cdxj")
+
+      assert_equal CDX::Backends::RbCDX::Format::MAGIC, File.binread(output, CDX::Backends::RbCDX::Format::MAGIC.bytesize)
+    end
+  end
+
   def test_repack_spools_hot_and_cold_sections_to_format_writer
     writer_sections = []
-    original_write_file = CDX::RbcdxFormat.method(:write_file)
+    original_write_file = CDX::Backends::RbCDX::Format.method(:write_file)
     replacement_write_file = lambda do |output_path, dict_data:, directory_data:, hot_data:, cold_data:, header:|
       writer_sections << [hot_data, cold_data]
       original_write_file.call(
@@ -118,7 +130,7 @@ class RepackerTest < Minitest::Test
       )
     end
 
-    with_singleton_replacement(CDX::RbcdxFormat, :write_file, replacement_write_file) do
+    with_singleton_replacement(CDX::Backends::RbCDX::Format, :write_file, replacement_write_file) do
       Dir.mktmpdir do |dir|
         input = File.join(dir, "sample.cdxj")
         output = File.join(dir, "sample.rbcdx")
@@ -198,7 +210,7 @@ class RepackerTest < Minitest::Test
         output,
         filters: ["about"],
         filter_registry: {
-          "about" => ->(record) { record["url"].to_s.end_with?("/about") }
+          "about" => ->(record) { record.url.to_s.end_with?("/about") }
         }
       )
 
@@ -218,13 +230,55 @@ class RepackerTest < Minitest::Test
         output,
         filters: ["+ok,-about"],
         filter_registry: {
-          "ok" => ->(record) { record["status"].to_s == "200" },
-          "about" => ->(record) { record["url"].to_s.end_with?("/about") }
+          "ok" => ->(record) { record.status.to_s == "200" },
+          "about" => ->(record) { record.url.to_s.end_with?("/about") }
         }
       )
 
       assert_equal 1, result.record_count
       assert_equal ["https://blog.example.com/post"], CDX::Index.open(output).map(&:url)
+    end
+  end
+
+  def test_repack_extractable_text_filter_keeps_human_text_captures
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "extractable.cdxj")
+      output = File.join(dir, "extractable.rbcdx")
+      File.write(input, extractable_text_cdxj)
+
+      result = CDX::Repacker.repack(input, output, filters: ["extractable-text"])
+
+      assert_equal 7, result.record_count
+      assert_equal [
+        "https://example.com/",
+        "https://example.com/about.txt",
+        "https://example.com/feed.xml",
+        "https://example.com/octet-html",
+        "https://example.com/README.md",
+        "https://example.com/sitemap-guide",
+        "https://example.org/xhtml"
+      ], CDX::Index.open(output).map(&:url)
+    end
+  end
+
+  def test_repack_text_filter_pieces_are_composable
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "extractable.cdxj")
+      output = File.join(dir, "extractable.rbcdx")
+      File.write(input, extractable_text_cdxj)
+
+      result = CDX::Repacker.repack(input, output, filters: ["+status-200,+warc,+text-like,-asset-like,-site-metadata"])
+
+      assert_equal 7, result.record_count
+      assert_equal [
+        "https://example.com/",
+        "https://example.com/about.txt",
+        "https://example.com/feed.xml",
+        "https://example.com/octet-html",
+        "https://example.com/README.md",
+        "https://example.com/sitemap-guide",
+        "https://example.org/xhtml"
+      ], CDX::Index.open(output).map(&:url)
     end
   end
 
@@ -240,7 +294,7 @@ class RepackerTest < Minitest::Test
       CDX::Repacker.repack(
         input,
         output,
-        filters: [->(record) { record["url"].to_s.start_with?("https://example.com/") }]
+        filters: [->(record) { record.url.to_s.start_with?("https://example.com/") }]
       )
 
       assert_equal ["https://example.com/"], CDX::Index.open(output).map(&:url)
@@ -253,7 +307,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "unsorted.rbcdx")
       File.write(input, sorted_cdxj.lines.reverse.join)
 
-      error = assert_raises(CDX::RbcdxFormat::EncodeError) do
+      error = assert_raises(CDX::Backends::RbCDX::Format::EncodeError) do
         CDX::Repacker.repack(input, output)
       end
       assert_match(/input is not sorted by urlkey/, error.message)
@@ -266,7 +320,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "bad-digest.rbcdx")
       File.write(input, sorted_cdxj.sub("IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOI", "IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOIA"))
 
-      error = assert_raises(CDX::RbcdxFormat::EncodeError) do
+      error = assert_raises(CDX::Backends::RbCDX::Format::EncodeError) do
         CDX::Repacker.repack(input, output)
       end
       assert_match(/not canonical unpadded base32 SHA-1/, error.message)
@@ -279,7 +333,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "bad-digest.rbcdx")
       File.write(input, sorted_cdxj.sub("IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOI", "IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOI="))
 
-      error = assert_raises(CDX::RbcdxFormat::EncodeError) do
+      error = assert_raises(CDX::Backends::RbCDX::Format::EncodeError) do
         CDX::Repacker.repack(input, output)
       end
       assert_match(/not canonical unpadded base32 SHA-1/, error.message)
@@ -292,7 +346,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "bad-digest.rbcdx")
       File.write(input, sorted_cdxj.sub("IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOI", "IFUIEFR56GZBO3ZK43VE=SLQ5QOFXDOI"))
 
-      error = assert_raises(CDX::RbcdxFormat::EncodeError) do
+      error = assert_raises(CDX::Backends::RbCDX::Format::EncodeError) do
         CDX::Repacker.repack(input, output)
       end
       assert_match(/not canonical unpadded base32 SHA-1/, error.message)
@@ -311,8 +365,64 @@ class RepackerTest < Minitest::Test
 
       assert_equal 0, status
       assert_equal "#{output}\n", out.string
-      assert_empty err.string
+      assert_match(/processing \[1\/1\]/, err.string)
+      assert_match(/written \[1\/1\]/, err.string)
       assert_equal ["https://example.com/about"], CDX::Index.open(output).captures("example.com/about").map(&:url)
+    end
+  end
+
+  def test_cli_repack_dry_run_prints_plan_and_filter_count_without_writing
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      out = StringIO.new
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "status-200", "--dry-run", input], out: out, err: err)
+
+      assert_equal 0, status
+      assert_match(/would create \[1\/1\] #{Regexp.escape(output)} from #{Regexp.escape(input)}/, out.string)
+      assert_match(/filtered \[1\/1\] #{Regexp.escape(input)}: 2 of 3 records passed filters/, out.string)
+      assert_empty err.string
+      refute File.exist?(output)
+    end
+  end
+
+  def test_cli_repack_dry_run_rejects_selected_unencodable_records
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "bad.cdxj")
+      output = File.join(dir, "bad.rbcdx")
+      File.write(input, <<~CDXJ)
+        com,bad)/ 20240101010101 {"url":"ftp://bad.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      out = StringIO.new
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "extractable-text", "--dry-run", input], out: out, err: err)
+
+      assert_equal 1, status
+      assert_empty out.string
+      assert_match(/rbcdx only encodes http and https schemes/, err.string)
+      refute File.exist?(output)
+    end
+  end
+
+  def test_cli_repack_dry_run_rejects_existing_output_without_force
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      File.write(output, "already here")
+      out = StringIO.new
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output", output, "--dry-run", input], out: out, err: err)
+
+      assert_equal 1, status
+      assert_empty out.string
+      assert_match(/output already exists/, err.string)
+      assert_equal "already here", File.read(output)
     end
   end
 
@@ -327,7 +437,8 @@ class RepackerTest < Minitest::Test
       status = CDX::CLI.start(["repack", "--output", output, "--filter", "status-200", input], out: out, err: err)
 
       assert_equal 0, status
-      assert_empty err.string
+      assert_match(/processing \[1\/1\]/, err.string)
+      assert_match(/written \[1\/1\]/, err.string)
       assert_equal ["https://example.com/about", "https://blog.example.com/post"], CDX::Index.open(output).map(&:url)
     end
   end
@@ -343,7 +454,8 @@ class RepackerTest < Minitest::Test
       status = CDX::CLI.start(["repack", "--output", output, "--filter", "+status-200,+html,-warc", input], out: out, err: err)
 
       assert_equal 0, status
-      assert_empty err.string
+      assert_match(/processing \[1\/1\]/, err.string)
+      assert_match(/written \[1\/1\]/, err.string)
       assert_empty CDX::Index.open(output).map(&:url)
     end
   end
@@ -370,7 +482,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "bad.rbcdx")
       File.write(input, sorted_cdxj.sub("IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOI", "IFUIEFR56GZBO3ZK43VEKSLQ5QOFXDOI="))
 
-      assert_raises(CDX::RbcdxFormat::EncodeError) do
+      assert_raises(CDX::Backends::RbCDX::Format::EncodeError) do
         CDX::Repacker.repack(input, output)
       end
 
@@ -492,15 +604,17 @@ class RepackerTest < Minitest::Test
         [input_dir],
         output_dir: output_dir,
         max_records: 1,
-        progress: ->(event, **payload) { events << [event, payload.fetch(:entry).fetch("output_path")] }
+        progress: ->(event, **payload) { events << [event, payload[:entry]&.fetch("output_path") || payload[:path]] }
       )
 
       assert_equal [:written, :written], results.map(&:status)
       assert File.file?(File.join(output_dir, "cdx-00000.rbcdx"))
       assert File.file?(File.join(output_dir, "cdx-00001.rbcdx"))
       assert File.file?(File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME))
-      assert File.file?(File.join(output_dir, CDX::RbcdxManifest::FILENAME))
+      assert File.file?(File.join(output_dir, CDX::Backends::RbCDX::Manifest::FILENAME))
       assert_equal ["https://example.com/about"], CDX::Index.open(File.join(output_dir, "cdx-00000.rbcdx")).captures("example.com/about").map(&:url)
+      assert_includes events.map(&:first), :state_start
+      assert_includes events.map(&:first), :state_finish
       assert_includes events.map(&:first), :start
       assert_includes events.map(&:first), :finish
     end
@@ -529,7 +643,7 @@ class RepackerTest < Minitest::Test
 
       refute File.exist?(first)
       refute File.exist?(second)
-      manifest = JSON.parse(File.read(File.join(output_dir, CDX::RbcdxManifest::FILENAME)))
+      manifest = JSON.parse(File.read(File.join(output_dir, CDX::Backends::RbCDX::Manifest::FILENAME)))
       assert_equal ["cdx-00000.rbcdx", "cdx-00001.rbcdx"], manifest.fetch("files").map { |entry| entry.fetch("path") }.sort
       assert_equal ["deleted", "deleted"], JSON.parse(File.read(File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME))).fetch("entries").map { |entry| entry.fetch("status") }
     end
@@ -548,12 +662,113 @@ class RepackerTest < Minitest::Test
         [input],
         output_dir: output_dir,
         dry_run: true,
-        progress: ->(event, **payload) { events << [event, payload.fetch(:entry).fetch("output_path")] }
+        progress: ->(event, **payload) { events << [event, payload[:entry]&.fetch("output_path") || payload[:path]] }
       )
 
       assert_equal [:planned], results.map(&:status)
+      assert_equal 3, results.first.result.record_count
+      assert_equal 3, results.first.result.total_records
       refute Dir.exist?(output_dir)
-      assert_equal [[:planned, File.join(output_dir, "sample.rbcdx")]], events
+      assert_equal [
+        [:planned, File.join(output_dir, "sample.rbcdx")],
+        [:preview, File.join(output_dir, "sample.rbcdx")]
+      ], events
+    end
+  end
+
+  def test_repack_many_dry_run_reports_filtered_count
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      FileUtils.mkdir_p(input_dir)
+      input = File.join(input_dir, "sample.cdxj")
+      output_dir = File.join(dir, "rbcdx")
+      File.write(input, sorted_cdxj)
+
+      results = CDX::Repacker.repack_many(
+        [input],
+        output_dir: output_dir,
+        filters: ["status-200"],
+        dry_run: true
+      )
+
+      assert_equal [:planned], results.map(&:status)
+      assert_equal 2, results.first.result.record_count
+      assert_equal 3, results.first.result.total_records
+      assert_equal 1, results.first.result.filtered_count
+      refute Dir.exist?(output_dir)
+    end
+  end
+
+  def test_repack_many_dry_run_resume_skips_matching_deleted_sources
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      CDX::Repacker.repack_many([dir], output_dir: dir, delete_when_processed: true)
+      events = []
+
+      results = CDX::Repacker.repack_many(
+        [dir],
+        output_dir: dir,
+        resume: true,
+        delete_when_processed: true,
+        dry_run: true,
+        progress: ->(event, **payload) { events << [event, payload[:entry]&.fetch("output_path") || payload[:path]] }
+      )
+
+      assert_equal [:skipped], results.map(&:status)
+      refute File.exist?(input)
+      assert File.file?(output)
+      assert_equal [[:skip, output]], events
+    end
+  end
+
+  def test_repack_many_dry_run_rejects_existing_output_without_force
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p([input_dir, output_dir])
+      input = File.join(input_dir, "sample.cdxj")
+      output = File.join(output_dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      File.write(output, "already here")
+      events = []
+
+      error = assert_raises(CDX::Error) do
+        CDX::Repacker.repack_many(
+          [input],
+          output_dir: output_dir,
+          dry_run: true,
+          progress: ->(event, **payload) { events << [event, payload[:entry]&.fetch("output_path") || payload[:path]] }
+        )
+      end
+
+      assert_match(/output already exists/, error.message)
+      assert_empty events
+      assert_equal "already here", File.read(output)
+    end
+  end
+
+  def test_repack_many_dry_run_allows_existing_output_with_force
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p([input_dir, output_dir])
+      input = File.join(input_dir, "sample.cdxj")
+      output = File.join(output_dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      File.write(output, "already here")
+
+      results = CDX::Repacker.repack_many(
+        [input],
+        output_dir: output_dir,
+        dry_run: true,
+        force: true
+      )
+
+      assert_equal [:planned], results.map(&:status)
+      assert_equal 3, results.first.result.total_records
+      assert_equal "already here", File.read(output)
     end
   end
 
@@ -644,50 +859,72 @@ class RepackerTest < Minitest::Test
     end
   end
 
-  def test_repack_many_rejects_same_input_and_output_directory
+  def test_repack_many_allows_same_directory_without_deleting_sources
     Dir.mktmpdir do |dir|
       input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
       File.write(input, sorted_cdxj)
 
-      error = assert_raises(ArgumentError) do
-        CDX::Repacker.repack_many([input], output_dir: dir)
-      end
+      results = CDX::Repacker.repack_many([input], output_dir: dir)
 
-      assert_match(/output directory must be separate/, error.message)
+      assert_equal [:written], results.map(&:status)
+      assert File.exist?(input)
+      assert File.file?(output)
+      assert_equal ["https://example.com/about"], CDX::Index.open(output).captures("example.com/about").map(&:url)
     end
   end
 
-  def test_repack_many_rejects_output_directory_inside_input_directory
+  def test_repack_many_allows_same_directory_when_deleting_sources
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+
+      results = CDX::Repacker.repack_many([dir], output_dir: dir, delete_when_processed: true)
+
+      assert_equal [:written], results.map(&:status)
+      refute File.exist?(input)
+      assert File.file?(output)
+      assert File.file?(File.join(dir, CDX::BatchRepacker::STATE_FILENAME))
+      assert File.file?(File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME))
+      assert_equal ["https://example.com/about"], CDX::Index.open(dir).captures("example.com/about").map(&:url)
+
+      resumed = CDX::Repacker.repack_many([dir], output_dir: dir, resume: true, delete_when_processed: true)
+      assert_equal [:skipped], resumed.map(&:status)
+    end
+  end
+
+  def test_repack_many_allows_output_directory_inside_input_directory
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(input_dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      input = File.join(input_dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir)
+
+      assert_equal [:written], results.map(&:status)
+      assert File.exist?(input)
+      assert_equal ["https://example.com/about"], CDX::Index.open(File.join(output_dir, "sample.rbcdx")).captures("example.com/about").map(&:url)
+    end
+  end
+
+  def test_repack_many_allows_glob_output_directory_inside_input_tree
     Dir.mktmpdir do |dir|
       input_dir = File.join(dir, "cdx")
       output_dir = File.join(input_dir, "rbcdx")
       FileUtils.mkdir_p(input_dir)
       File.write(File.join(input_dir, "sample.cdxj"), sorted_cdxj)
 
-      error = assert_raises(ArgumentError) do
-        CDX::Repacker.repack_many([input_dir], output_dir: output_dir)
-      end
+      results = CDX::Repacker.repack_many([File.join(input_dir, "*.cdxj")], output_dir: output_dir)
 
-      assert_match(/output directory must be separate/, error.message)
+      assert_equal [:written], results.map(&:status)
+      assert File.file?(File.join(output_dir, "sample.rbcdx"))
     end
   end
 
-  def test_repack_many_rejects_glob_output_directory_inside_input_tree
-    Dir.mktmpdir do |dir|
-      input_dir = File.join(dir, "cdx")
-      output_dir = File.join(input_dir, "rbcdx")
-      FileUtils.mkdir_p(input_dir)
-      File.write(File.join(input_dir, "sample.cdxj"), sorted_cdxj)
-
-      error = assert_raises(ArgumentError) do
-        CDX::Repacker.repack_many([File.join(input_dir, "*.cdxj")], output_dir: output_dir)
-      end
-
-      assert_match(/output directory must be separate/, error.message)
-    end
-  end
-
-  def test_repack_many_rejects_recursive_glob_output_directory_inside_input_tree
+  def test_repack_many_allows_recursive_glob_output_directory_inside_input_tree
     Dir.mktmpdir do |dir|
       input_dir = File.join(dir, "cdx")
       shard_dir = File.join(input_dir, "shards")
@@ -695,15 +932,14 @@ class RepackerTest < Minitest::Test
       FileUtils.mkdir_p(shard_dir)
       File.write(File.join(shard_dir, "sample.cdxj"), sorted_cdxj)
 
-      error = assert_raises(ArgumentError) do
-        CDX::Repacker.repack_many([File.join(input_dir, "**", "*.cdxj")], output_dir: output_dir)
-      end
+      results = CDX::Repacker.repack_many([File.join(input_dir, "**", "*.cdxj")], output_dir: output_dir)
 
-      assert_match(/output directory must be separate/, error.message)
+      assert_equal [:written], results.map(&:status)
+      assert File.file?(File.join(output_dir, "sample.rbcdx"))
     end
   end
 
-  def test_repack_many_rejects_symlinked_output_directory_inside_input_tree
+  def test_repack_many_allows_symlinked_output_directory_inside_input_tree
     Dir.mktmpdir do |dir|
       input_dir = File.join(dir, "cdx")
       output_dir = File.join(dir, "rbcdx-link")
@@ -712,12 +948,11 @@ class RepackerTest < Minitest::Test
       File.write(input, sorted_cdxj)
       File.symlink(input_dir, output_dir)
 
-      error = assert_raises(ArgumentError) do
-        CDX::Repacker.repack_many([input_dir], output_dir: output_dir, delete_when_processed: true)
-      end
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir)
 
-      assert_match(/output directory must be separate/, error.message)
+      assert_equal [:written], results.map(&:status)
       assert File.exist?(input)
+      assert File.file?(File.join(input_dir, "sample.rbcdx"))
     end
   end
 
@@ -739,7 +974,7 @@ class RepackerTest < Minitest::Test
       end
 
       assert_match(/output already exists/, error.message)
-      refute File.exist?(File.join(output_dir, CDX::RbcdxManifest::FILENAME))
+      refute File.exist?(File.join(output_dir, CDX::Backends::RbCDX::Manifest::FILENAME))
       state = JSON.parse(File.read(File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)))
       assert_equal ["complete", "failed"], state.fetch("entries").map { |entry| entry.fetch("status") }
     end
@@ -773,7 +1008,7 @@ class RepackerTest < Minitest::Test
         [input],
         output_dir: output_dir,
         resume: true,
-        filters: [->(record) { record["status"] == "200" }],
+        filters: [->(record) { record.status == "200" }],
         filter_signature: "status-is-200"
       )
 
@@ -795,10 +1030,510 @@ class RepackerTest < Minitest::Test
       status = CDX::CLI.start(["repack", "--output-dir", output_dir, "--dry-run", input], out: out, err: err)
 
       assert_equal 0, status
-      assert_match(/planned \[1\/1\].*sample\.cdxj -> .*sample\.rbcdx/, out.string)
+      assert_match(/would create \[1\/1\].*sample\.rbcdx from .*sample\.cdxj/, out.string)
+      assert_match(/filtered \[1\/1\].*sample\.cdxj: 3 of 3 records passed filters/, out.string)
       assert_empty err.string
       refute Dir.exist?(output_dir)
     end
+  end
+
+  def test_cli_repack_many_dry_run_reports_delete_plan
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+      out = StringIO.new
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output-dir", dir, "--delete-when-processed", "--dry-run", input], out: out, err: err)
+
+      assert_equal 0, status
+      assert_match(/would create \[1\/1\].*sample\.rbcdx from .*sample\.cdxj/, out.string)
+      assert_match(/would delete after written output \[1\/1\] #{Regexp.escape(input)}/, out.string)
+      assert_match(/filtered \[1\/1\].*sample\.cdxj: 3 of 3 records passed filters/, out.string)
+      assert_empty err.string
+      assert File.exist?(input)
+      refute File.exist?(File.join(dir, "sample.rbcdx"))
+    end
+  end
+
+  def test_cli_repack_defaults_to_current_directory_for_batch_input_and_output
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack"], out: out, err: err)
+
+        assert_equal 0, status
+      end
+
+      assert_equal "#{File.join(File.realpath(dir), "sample.rbcdx")}\n", out.string
+      assert_includes err.string, "created resume log "
+      assert_includes err.string, CDX::CLI::REPACK_LOG_FILENAME
+      assert_match(/if interrupted, run: rbcdx repack --resume/, err.string)
+      assert_includes err.string, "created repack state "
+      assert_includes err.string, CDX::BatchRepacker::STATE_FILENAME
+      assert_match(/processing \[1\/1\]/, err.string)
+      assert_includes err.string, "removed resume log "
+      assert_includes err.string, CDX::CLI::REPACK_LOG_FILENAME
+      assert File.exist?(input)
+      assert File.file?(output)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_output_dir_defaults_input_to_current_directory
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "out")
+      File.write(input, sorted_cdxj)
+      out = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--output-dir", output_dir], out: out, err: StringIO.new)
+
+        assert_equal 0, status
+      end
+
+      assert_match(/sample\.rbcdx/, out.string)
+      assert File.file?(File.join(output_dir, "sample.rbcdx"))
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_uses_request_log
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      real_log_path = File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)
+      File.write(input, sorted_cdxj)
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        calls = 0
+        original_repack = CDX::Repacker.method(:repack)
+        replacement_repack = lambda do |*args, **options|
+          calls += 1
+          raise CDX::Error, "simulated interruption" if calls == 1
+
+          original_repack.call(*args, **options)
+        end
+
+        with_singleton_replacement(CDX::Repacker, :repack, replacement_repack) do
+          first_err = StringIO.new
+          status = CDX::CLI.start(["repack", "--output-dir", output_dir, "--filter", "status-200", input], out: StringIO.new, err: first_err)
+
+          assert_equal 1, status
+          assert_includes first_err.string, "created resume log #{real_log_path}"
+          assert_match(/if interrupted, run: rbcdx repack --resume/, first_err.string)
+          assert_includes first_err.string, "created repack state "
+          assert_includes first_err.string, CDX::BatchRepacker::STATE_FILENAME
+          assert_includes first_err.string, "resume log kept #{real_log_path}"
+          assert_match(/resume with: rbcdx repack --resume/, first_err.string)
+        end
+
+        log = JSON.parse(File.read(log_path))
+        assert_equal "rbcdx-repack-log", log.fetch("format")
+        assert_equal [input], log.fetch("request").fetch("inputs")
+        assert_equal output_dir, log.fetch("request").fetch("options").fetch("output_dir")
+        assert_equal ["status-200"], log.fetch("request").fetch("options").fetch("filters")
+
+        out = StringIO.new
+        err = StringIO.new
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 0, status
+        assert_includes err.string, "resuming from #{real_log_path}"
+        assert_includes err.string, "loaded repack state "
+        assert_includes err.string, CDX::BatchRepacker::STATE_FILENAME
+        assert_match(/processing \[1\/1\]/, err.string)
+        assert_includes err.string, "removed resume log #{real_log_path}"
+        assert_equal "#{File.join(output_dir, "sample.rbcdx")}\n", out.string
+        assert File.file?(File.join(output_dir, "sample.rbcdx"))
+        refute File.exist?(log_path)
+      end
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_without_log_is_clear
+    Dir.mktmpdir do |dir|
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/no repack log found/, err.string)
+      assert_includes err.string, CDX::CLI::REPACK_LOG_FILENAME
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_malformed_request_log
+    Dir.mktmpdir do |dir|
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      File.write(log_path, "{not-json}\n")
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/malformed repack log JSON/, err.string)
+      assert File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_invalid_request_log_shape
+    Dir.mktmpdir do |dir|
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      File.write(log_path, "#{JSON.pretty_generate({"format" => CDX::CLI::REPACK_LOG_FORMAT, "version" => CDX::CLI::REPACK_LOG_VERSION, "request" => "nope"})}\n")
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack log request/, err.string)
+      assert File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_invalid_request_log_inputs
+    Dir.mktmpdir do |dir|
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      write_cli_repack_log(log_path, inputs: [nil], output_dir: File.join(dir, "packed"))
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack log input path/, err.string)
+      assert File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_empty_request_log_inputs
+    Dir.mktmpdir do |dir|
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      write_cli_repack_log(log_path, inputs: [], output_dir: File.join(dir, "packed"))
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack log input path/, err.string)
+      assert File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_non_boolean_delete_when_processed
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      File.write(input, sorted_cdxj)
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir, delete_when_processed: "false")
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack log delete_when_processed/, err.string)
+      assert File.exist?(input)
+      refute File.exist?(File.join(output_dir, "sample.rbcdx"))
+      assert File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_unsupported_request_log_version
+    Dir.mktmpdir do |dir|
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      write_cli_repack_log(log_path, inputs: [], output_dir: File.join(dir, "packed"), version: 999)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/unsupported repack log version 999/, err.string)
+      assert File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_uses_request_log_when_state_is_missing
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      File.write(input, sorted_cdxj)
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir, filters: ["status-200"])
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 0, status
+      end
+
+      assert_equal "#{File.join(output_dir, "sample.rbcdx")}\n", out.string
+      assert_includes err.string, "resuming from #{File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)}"
+      assert_match(/creating repack state/, err.string)
+      assert_match(/processing \[1\/1\]/, err.string)
+      assert File.file?(File.join(output_dir, "sample.rbcdx"))
+      refute File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_keeps_request_log_when_state_is_corrupt
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      state_path = File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)
+      File.write(input, sorted_cdxj)
+      FileUtils.mkdir_p(output_dir)
+      File.write(state_path, "{not-json}\n")
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/malformed repack state JSON/, err.string)
+      assert_includes err.string, "resume log kept #{File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)}"
+      assert File.exist?(log_path)
+      refute File.exist?(File.join(output_dir, "sample.rbcdx"))
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_invalid_state_entries_shape
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      state_path = File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)
+      File.write(input, sorted_cdxj)
+      FileUtils.mkdir_p(output_dir)
+      File.write(state_path, "#{JSON.pretty_generate({"format" => CDX::BatchRepacker::FORMAT, "version" => CDX::BatchRepacker::VERSION, "entries" => "bad"})}\n")
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack state entries/, err.string)
+      assert_includes err.string, "resume log kept #{File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)}"
+      assert File.exist?(log_path)
+      assert File.exist?(input)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_invalid_state_entry
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      state_path = File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)
+      File.write(input, sorted_cdxj)
+      FileUtils.mkdir_p(output_dir)
+      File.write(state_path, "#{JSON.pretty_generate({"format" => CDX::BatchRepacker::FORMAT, "version" => CDX::BatchRepacker::VERSION, "entries" => [{"input_path" => input}]})}\n")
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack state entry/, err.string)
+      assert_includes err.string, "resume log kept #{File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)}"
+      assert File.exist?(log_path)
+      assert File.exist?(input)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_invalid_state_entry_field_types
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      state_path = File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)
+      File.write(input, sorted_cdxj)
+      FileUtils.mkdir_p(output_dir)
+      File.write(state_path, "#{JSON.pretty_generate({
+        "format" => CDX::BatchRepacker::FORMAT,
+        "version" => CDX::BatchRepacker::VERSION,
+        "plan" => {},
+        "entries" => [{
+          "input_path" => input,
+          "output_path" => [],
+          "source_signature" => {},
+          "status" => "pending"
+        }]
+      })}\n")
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume"], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/invalid repack state entry: invalid entry field type/, err.string)
+      assert_includes err.string, "resume log kept #{File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)}"
+      assert File.exist?(log_path)
+      assert File.exist?(input)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_rejects_explicit_args
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output_dir = File.join(dir, "packed")
+      File.write(input, sorted_cdxj)
+      CDX::Repacker.repack_many([input], output_dir: output_dir)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume", "--output-dir", output_dir, input], out: out, err: err)
+
+        assert_equal 1, status
+      end
+
+      assert_empty out.string
+      assert_match(/repack --resume uses rbcdx-repack-log\.json/, err.string)
+      assert_match(/without input paths or --output-dir/, err.string)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_refuses_to_start_over_with_active_log
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+      File.write(File.join(dir, CDX::CLI::REPACK_LOG_FILENAME), "{}\n")
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        out = StringIO.new
+        err = StringIO.new
+
+        status = CDX::CLI.start(["repack", input], out: out, err: err)
+
+        assert_equal 1, status
+        assert_empty out.string
+        assert_match(/repack log already exists/, err.string)
+      end
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_single_file_output_still_requires_input
+    out = StringIO.new
+    err = StringIO.new
+
+    status = CDX::CLI.start(["repack", "--output", "sample.rbcdx"], out: out, err: err)
+
+    assert_equal 1, status
+    assert_match(/missing input CDXJ path/, err.string)
   end
 
   def test_cli_repack_many_where_filter_and_progress
@@ -821,17 +1556,278 @@ class RepackerTest < Minitest::Test
     end
   end
 
+  def test_repack_filters_receive_capture_objects
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      seen = []
+      File.write(input, sorted_cdxj)
+
+      CDX::Repacker.repack(
+        input,
+        output,
+        filters: [->(record) {
+          seen << record
+          true
+        }]
+      )
+
+      assert seen.all? { |record| record.is_a?(CDX::Capture) }
+      assert_equal ["https://example.com/about"], CDX::Index.open(output).captures("example.com/about").map(&:url)
+    end
+  end
+
+  def test_repack_cdxj_output_preserves_selected_raw_lines
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "filtered.cdxj")
+      lines = sorted_cdxj.lines
+      File.write(input, sorted_cdxj)
+
+      result = CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status-200"])
+
+      assert_equal 2, result.record_count
+      assert_equal "cdxj", result.output_format
+      assert_equal lines[1..2].join, File.read(output)
+    end
+  end
+
+  def test_repack_cdxj_output_format_is_not_inferred_from_filename
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "anything.rbcdx")
+      File.write(input, sorted_cdxj)
+
+      CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status-200"])
+
+      refute_equal CDX::Backends::RbCDX::Format::MAGIC, File.binread(output, CDX::Backends::RbCDX::Format::MAGIC.bytesize)
+      assert_match(/\Acom,example\)\/about 20240202020202 /, File.read(output))
+    end
+  end
+
+  def test_repack_cdxj_output_accepts_records_rbcdx_cannot_encode
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "future.cdxj")
+      output = File.join(dir, "future.cdxj")
+      File.write(input, <<~CDXJ)
+        com,bad)/ 20240101010101 {"url":"ftp://bad.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz","future":"kept"}
+      CDXJ
+
+      assert_raises(ArgumentError) { CDX::Repacker.repack(input, input, output_format: "cdxj") }
+      CDX::Repacker.repack(input, output.sub(".cdxj", ".out"), output_format: "cdxj")
+
+      assert_match(/"future":"kept"/, File.read(output.sub(".cdxj", ".out")))
+    end
+  end
+
+  def test_repack_cdxj_gzip_output_uses_output_extension_only_for_compression
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "weird.name.gz")
+      File.write(input, sorted_cdxj)
+
+      CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status-200"])
+
+      assert_equal sorted_cdxj.lines[1..2].join, gzip_read(output)
+    end
+  end
+
+  def test_repack_cdxj_streams_input_once_by_default
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.cdxj.filtered")
+      File.write(input, sorted_cdxj)
+      calls = 0
+      original = CDX::Backends::CDXJ::RepackReader.instance_method(:each_capture)
+
+      replace_instance_method(CDX::Backends::CDXJ::RepackReader, :each_capture, proc do |&block|
+        calls += 1
+        original.bind_call(self, &block)
+      end)
+      begin
+        CDX::Repacker.repack(input, output, output_format: "cdxj")
+
+        assert_equal 1, calls
+      ensure
+        replace_instance_method(CDX::Backends::CDXJ::RepackReader, :each_capture, original)
+      end
+    end
+  end
+
+  def test_repack_many_cdxj_preserves_basename_when_output_dir_differs
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "source")
+      output_dir = File.join(dir, "out")
+      FileUtils.mkdir_p(input_dir)
+      input = File.join(input_dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+
+      results = CDX::Repacker.repack_many([input], output_dir: output_dir, output_format: "cdxj", filters: ["status-200"])
+
+      assert_equal [:written], results.map(&:status)
+      assert File.file?(File.join(output_dir, "sample.cdxj"))
+      assert_equal sorted_cdxj.lines[1..2].join, File.read(File.join(output_dir, "sample.cdxj"))
+    end
+  end
+
+  def test_repack_many_cdxj_same_directory_uses_filtered_name
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.filtered.cdxj")
+      File.write(input, sorted_cdxj)
+
+      results = CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status-200"])
+
+      assert_equal [:written], results.map(&:status)
+      assert File.file?(output)
+      assert_equal sorted_cdxj.lines[1..2].join, File.read(output)
+      refute File.exist?(File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME))
+      state = JSON.parse(File.read(File.join(dir, CDX::BatchRepacker::STATE_FILENAME)))
+      assert_equal ["cdxj"], state.fetch("entries").map { |entry| entry.fetch("output_format") }
+    end
+  end
+
+  def test_repack_many_rejects_output_colliding_with_another_input
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "source")
+      output_dir = File.join(dir, "out")
+      FileUtils.mkdir_p([input_dir, output_dir])
+      input = File.join(input_dir, "sample.cdxj")
+      colliding_input = File.join(output_dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+      File.write(colliding_input, sorted_cdxj)
+
+      error = assert_raises(ArgumentError) do
+        CDX::Repacker.repack_many([input, colliding_input], output_dir: output_dir, output_format: "cdxj")
+      end
+
+      assert_match(/planned output collides with input path/, error.message)
+    end
+  end
+
+  def test_repack_many_cdxj_resume_skips_matching_output_from_state
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+
+      CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status-200"])
+      results = CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status-200"], resume: true)
+
+      assert_equal [:skipped], results.map(&:status)
+    end
+  end
+
+  def test_repack_many_cdxj_resume_ignores_same_directory_output
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.filtered.cdxj")
+      File.write(input, sorted_cdxj)
+
+      CDX::Repacker.repack_many([dir], output_dir: dir, output_format: "cdxj", filters: ["status-200"], delete_when_processed: true)
+      results = CDX::Repacker.repack_many([dir], output_dir: dir, output_format: "cdxj", filters: ["status-200"], delete_when_processed: true, resume: true)
+
+      assert_equal [:skipped], results.map(&:status)
+      refute File.exist?(input)
+      assert File.file?(output)
+    end
+  end
+
+  def test_repack_many_cdxj_resume_ignores_nested_output_dir
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "indexes")
+      source_dir = File.join(input_dir, "source")
+      output_dir = File.join(input_dir, "filtered")
+      FileUtils.mkdir_p(source_dir)
+      input = File.join(source_dir, "sample.cdxj")
+      output = File.join(output_dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+
+      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, output_format: "cdxj", filters: ["status-200"])
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir, output_format: "cdxj", filters: ["status-200"], resume: true)
+
+      assert_equal [:skipped], results.map(&:status)
+      assert File.file?(input)
+      assert File.file?(output)
+    end
+  end
+
+  def test_repack_many_cdxj_delete_does_not_delete_on_parse_error
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "bad.cdxj")
+      File.write(input, "com,bad)/ 20240101010101 {not-json}\n")
+
+      assert_raises(CDX::Backends::RbCDX::Format::EncodeError) do
+        CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", delete_when_processed: true)
+      end
+
+      assert File.exist?(input)
+      refute File.exist?(File.join(dir, "bad.filtered.cdxj"))
+    end
+  end
+
+  def test_cli_repack_cdxj_allows_weird_output_filename
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "anything.rbcdx")
+      File.write(input, sorted_cdxj)
+      out = StringIO.new
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output-format", "cdxj", "--output", output, "--filter", "status-200", input], out: out, err: err)
+
+      assert_equal 0, status
+      assert_equal "#{output}\n", out.string
+      assert_match(/processing \[1\/1\]/, err.string)
+      assert_match(/written \[1\/1\]/, err.string)
+      assert_match(/\Acom,example\)\/about 20240202020202 /, File.read(output))
+    end
+  end
+
+  def test_cli_repack_cdxj_rejects_rbcdx_tuning_flags
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.cdxj.out")
+      File.write(input, sorted_cdxj)
+      out = StringIO.new
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output-format", "cdxj", "--block-bytes", "100", "--output", output, input], out: out, err: err)
+
+      assert_equal 1, status
+      assert_empty out.string
+      assert_match(/--block-bytes only applies/, err.string)
+    end
+  end
+
   private
 
   def with_manifest_build_tracking
     builds = []
-    original_build = CDX::RbcdxManifest.method(:build)
+    original_build = CDX::Backends::RbCDX::Manifest.method(:build)
     replacement_build = lambda do |paths, **options|
       builds << Array(paths).map(&:to_s)
       original_build.call(paths, **options)
     end
 
-    with_singleton_replacement(CDX::RbcdxManifest, :build, replacement_build) { yield builds }
+    with_singleton_replacement(CDX::Backends::RbCDX::Manifest, :build, replacement_build) { yield builds }
+  end
+
+  def write_cli_repack_log(path, inputs:, output_dir:, version: CDX::CLI::REPACK_LOG_VERSION, output_format: "rbcdx", filters: [], where: [], delete_when_processed: false, manifest: true)
+    File.write(path, "#{JSON.pretty_generate({
+      "format" => CDX::CLI::REPACK_LOG_FORMAT,
+      "version" => version,
+      "request" => {
+        "inputs" => inputs,
+        "options" => {
+          "output_dir" => output_dir,
+          "output_format" => output_format,
+          "filters" => filters,
+          "where" => where,
+          "delete_when_processed" => delete_when_processed,
+          "manifest" => manifest
+        }
+      }
+    })}\n")
   end
 
   def with_singleton_replacement(object, method_name, replacement)
@@ -850,8 +1846,20 @@ class RepackerTest < Minitest::Test
     $VERBOSE = verbose
   end
 
+  def replace_instance_method(klass, method_name, callable)
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    klass.define_method(method_name, callable)
+  ensure
+    $VERBOSE = verbose
+  end
+
   def gzip_write(path, content)
     Zlib::GzipWriter.open(path) { |gzip| gzip.write(content) }
+  end
+
+  def gzip_read(path)
+    Zlib::GzipReader.open(path, &:read)
   end
 
   def corrupt_record_count(path)
@@ -860,8 +1868,8 @@ class RepackerTest < Minitest::Test
 
   def rewrite_header(path)
     File.open(path, "r+b") do |file|
-      magic = file.read(CDX::RbcdxFormat::MAGIC.bytesize)
-      raise "invalid test rbcdx magic" unless magic == CDX::RbcdxFormat::MAGIC
+      magic = file.read(CDX::Backends::RbCDX::Format::MAGIC.bytesize)
+      raise "invalid test rbcdx magic" unless magic == CDX::Backends::RbCDX::Format::MAGIC
 
       header_length = file.read(4).unpack1("L<")
       header_offset = file.pos
@@ -889,6 +1897,30 @@ class RepackerTest < Minitest::Test
       com,example)/repeat 20240101010101 {"url":"https://example.com/repeat","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
       com,example)/repeat 20240202020202 {"url":"https://example.com/repeat","mime":"text/html","status":"200","length":"20","offset":"11","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
       com,example)/repeat 20240303030303 {"url":"https://example.com/repeat","mime":"text/html","status":"200","length":"30","offset":"31","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def extractable_text_cdxj
+    <<~CDXJ
+      com,example)/ 20240101010101 {"url":"https://example.com/","mime":"text/html; charset=UTF-8","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/about.txt 20240101010102 {"url":"https://example.com/about.txt","mime":"text/plain","status":"200","length":"10","offset":"11","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/app.js 20240101010103 {"url":"https://example.com/app.js","mime":"application/javascript","status":"200","length":"10","offset":"21","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/feed.xml 20240101010104 {"url":"https://example.com/feed.xml","mime":"application/rss+xml","status":"200","length":"10","offset":"31","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/image.jpg 20240101010105 {"url":"https://example.com/image.jpg","mime":"image/jpeg","status":"200","length":"10","offset":"41","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/kml 20240101010105 {"url":"https://example.com/map.kml","mime":"application/vnd.google-earth.kml+xml","status":"200","length":"10","offset":"42","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/manifest.json 20240101010106 {"url":"https://example.com/manifest.json","mime":"text/plain","status":"200","length":"10","offset":"51","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/missing 20240101010107 {"url":"https://example.com/missing","mime":"text/html","status":"404","length":"10","offset":"61","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/octet-html 20240101010107 {"url":"https://example.com/octet-html","mime":"application/octet-stream","mime-detected":"text/html","status":"200","length":"10","offset":"62","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/playlist.xspf 20240101010107 {"url":"https://example.com/playlist.xspf","mime":"application/xspf+xml","status":"200","length":"10","offset":"63","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/post-sitemap.xml 20240101010107 {"url":"https://example.com/post-sitemap.xml","mime":"application/xml","status":"200","length":"10","offset":"64","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/readme.md 20240101010107 {"url":"https://example.com/README.md","mime":"text/markdown","status":"200","length":"10","offset":"65","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/robots.txt 20240101010108 {"url":"https://example.com/robots.txt","mime":"text/plain","status":"200","length":"10","offset":"71","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/robotstxt/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/sitemap 20240101010109 {"url":"https://example.com/sitemap","mime":"text/plain","mime-detected":"application/xml","status":"200","length":"10","offset":"80","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/sitemap-guide 20240101010109 {"url":"https://example.com/sitemap-guide","mime":"text/html","status":"200","length":"10","offset":"80","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/sitemap.xml 20240101010109 {"url":"https://example.com/sitemap.xml","mime":"application/xml","status":"200","length":"10","offset":"81","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/svg.svg 20240101010110 {"url":"https://example.com/svg.svg","mime":"application/svg+xml","status":"200","length":"10","offset":"91","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      com,example)/wp-sitemap-posts-post-1.xml 20240101010110 {"url":"https://example.com/wp-sitemap-posts-post-1.xml","mime":"application/xml","status":"200","length":"10","offset":"92","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      org,example)/xhtml 20240101010111 {"url":"https://example.org/xhtml","mime":"application/xhtml+xml","status":"200","length":"10","offset":"101","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
     CDXJ
   end
 end

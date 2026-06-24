@@ -230,7 +230,7 @@ class IndexTest < Minitest::Test
   def test_rbcdx_index_rejects_missing_header_length
     Dir.mktmpdir do |dir|
       path = File.join(dir, "sample.rbcdx")
-      File.binwrite(path, CDX::RbcdxFormat::MAGIC)
+      File.binwrite(path, CDX::Backends::RbCDX::Format::MAGIC)
 
       error = assert_raises(CDX::Error) { CDX::Index.open(path) }
       assert_match(/missing rbcdx header length/, error.message)
@@ -240,7 +240,7 @@ class IndexTest < Minitest::Test
   def test_rbcdx_index_rejects_truncated_header
     Dir.mktmpdir do |dir|
       path = File.join(dir, "sample.rbcdx")
-      File.binwrite(path, CDX::RbcdxFormat::MAGIC + [10].pack("L<") + "{}")
+      File.binwrite(path, CDX::Backends::RbCDX::Format::MAGIC + [10].pack("L<") + "{}")
 
       error = assert_raises(CDX::Error) { CDX::Index.open(path) }
       assert_match(/truncated rbcdx header/, error.message)
@@ -491,7 +491,7 @@ class IndexTest < Minitest::Test
         ].join("\n")
       )
 
-      zipnum = CDX::ZipNumIndex.new(cluster_path, [shard_path, middle_path])
+      zipnum = CDX::Backends::CDXJ::ZipNumIndex.new(cluster_path, [shard_path, middle_path])
       assert_equal [shard_path, middle_path], zipnum.paths
 
       capture = CDX::Index.open(dir).captures("zeta.com/*").first
@@ -573,7 +573,7 @@ class IndexTest < Minitest::Test
       cluster_path = File.join(dir, "cluster.idx")
       File.write(cluster_path, "example,zero)/\tcdx-00000.gz\t00008\t00009\t00001\n")
 
-      assert_predicate CDX::ZipNumIndex.new(cluster_path, []), :usable?
+      assert_predicate CDX::Backends::CDXJ::ZipNumIndex.new(cluster_path, []), :usable?
     end
   end
 
@@ -585,7 +585,7 @@ class IndexTest < Minitest::Test
       zeta = repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
         com,zeta)/ 20240101010101 {"url":"https://zeta.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
       CDXJ
-      CDX::RbcdxManifest.write([alpha, zeta], File.join(dir, CDX::RbcdxManifest::FILENAME))
+      CDX::Backends::RbCDX::Manifest.write([alpha, zeta], File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME))
       File.binwrite(zeta, "x" * File.size(zeta))
 
       index = CDX::Index.open(dir)
@@ -602,7 +602,7 @@ class IndexTest < Minitest::Test
       repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
         com,zeta)/ 20240101010101 {"url":"https://zeta.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
       CDXJ
-      CDX::RbcdxManifest.write([alpha], File.join(dir, CDX::RbcdxManifest::FILENAME))
+      CDX::Backends::RbCDX::Manifest.write([alpha], File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME))
 
       index = CDX::Index.open(dir)
 
@@ -771,8 +771,8 @@ class IndexTest < Minitest::Test
 
   def rewrite_rbcdx_header(path)
     File.open(path, "r+b") do |file|
-      magic = file.read(CDX::RbcdxFormat::MAGIC.bytesize)
-      raise "invalid test rbcdx magic" unless magic == CDX::RbcdxFormat::MAGIC
+      magic = file.read(CDX::Backends::RbCDX::Format::MAGIC.bytesize)
+      raise "invalid test rbcdx magic" unless magic == CDX::Backends::RbCDX::Format::MAGIC
 
       header_length = file.read(4).unpack1("L<")
       header_offset = file.pos
@@ -799,8 +799,8 @@ class IndexTest < Minitest::Test
 
   def read_rbcdx_header(path)
     File.open(path, "rb") do |file|
-      magic = file.read(CDX::RbcdxFormat::MAGIC.bytesize)
-      raise "invalid test rbcdx magic" unless magic == CDX::RbcdxFormat::MAGIC
+      magic = file.read(CDX::Backends::RbCDX::Format::MAGIC.bytesize)
+      raise "invalid test rbcdx magic" unless magic == CDX::Backends::RbCDX::Format::MAGIC
 
       header_length = file.read(4).unpack1("L<")
       JSON.parse(file.read(header_length))

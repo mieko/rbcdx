@@ -3,8 +3,8 @@ module CDX
     include Enumerable
 
     BACKENDS = [
-      Backends::Cdx,
-      Backends::Rbcdx
+      Backends::CDXJ,
+      Backends::RbCDX
     ].freeze
 
     attr_reader :paths
@@ -20,7 +20,7 @@ module CDX
       @paths = expand_paths(paths)
       raise ArgumentError, "no local index paths were provided" if @paths.empty?
 
-      @parser_factory = parser || -> { Parser.new }
+      @parser_factory = parser || -> { Backends::CDXJ::Parser.new }
       @backend = backend_for(@paths).new(@paths, parser_factory: @parser_factory)
     end
 
@@ -264,8 +264,8 @@ module CDX
 
     def validate_local_directory_mix!(files)
       files.group_by { |path| File.dirname(path) }.each do |dir, dir_files|
-        has_cdx_gzip = dir_files.any? { |path| Backends::Cdx.index_file?(path) && File.basename(path).end_with?(".gz") }
-        has_rbcdx = dir_files.any? { |path| Backends::Rbcdx.index_file?(path) }
+        has_cdx_gzip = dir_files.any? { |path| Backends::CDXJ.index_file?(path) && File.basename(path).end_with?(".gz") }
+        has_rbcdx = dir_files.any? { |path| Backends::RbCDX.index_file?(path) }
         next unless has_cdx_gzip && has_rbcdx
 
         raise ArgumentError, "cannot mix CDX .gz and .rbcdx index files in the same directory: #{dir}"

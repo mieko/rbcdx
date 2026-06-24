@@ -1,6 +1,6 @@
 require_relative "test_helper"
 
-class RbcdxFormatTest < Minitest::Test
+class RbCDXFormatTest < Minitest::Test
   ExpandingJsonValue = Class.new do
     def initialize
       @calls = 0
@@ -13,7 +13,7 @@ class RbcdxFormatTest < Minitest::Test
   end
 
   def test_parse_filename_treats_zero_padded_shards_as_decimal
-    parsed = CDX::RbcdxFormat.parse_filename(
+    parsed = CDX::Backends::RbCDX::Format.parse_filename(
       "sample.cdxj",
       1,
       "org,example)/",
@@ -25,17 +25,17 @@ class RbcdxFormatTest < Minitest::Test
   end
 
   def test_parse_nonnegative_integer_treats_zero_padded_values_as_decimal
-    assert_equal 843, CDX::RbcdxFormat.parse_nonnegative_integer("sample.cdxj", 1, "org,example)/", "offset", "00843")
+    assert_equal 843, CDX::Backends::RbCDX::Format.parse_nonnegative_integer("sample.cdxj", 1, "org,example)/", "offset", "00843")
   end
 
   def test_read_metadata_rejects_non_object_header_json
     Dir.mktmpdir do |dir|
       path = File.join(dir, "bad.rbcdx")
       header = JSON.generate([])
-      File.binwrite(path, CDX::RbcdxFormat::MAGIC + [header.bytesize].pack("L<") + header)
+      File.binwrite(path, CDX::Backends::RbCDX::Format::MAGIC + [header.bytesize].pack("L<") + header)
 
       error = assert_raises(CDX::Error) do
-        CDX::RbcdxFormat.read_metadata(path)
+        CDX::Backends::RbCDX::Format.read_metadata(path)
       end
 
       assert_match(/header must be a JSON object/, error.message)
@@ -49,7 +49,7 @@ class RbcdxFormatTest < Minitest::Test
     payload << "x"
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_payload(payload, "HOT3".b, ["one"])
+      CDX::Backends::RbCDX::Format.decode_payload(payload, "HOT3".b, ["one"])
     end
     assert_match(/column offsets are not monotonic/, error.message)
   end
@@ -57,27 +57,27 @@ class RbcdxFormatTest < Minitest::Test
   def test_front_coded_string_rejects_prefix_past_previous_string
     data = +"".b
     data << [32].pack("S<")
-    data << CDX::RbcdxFormat.varint(1)
-    data << CDX::RbcdxFormat.varint(0)
+    data << CDX::Backends::RbCDX::Format.varint(1)
+    data << CDX::Backends::RbCDX::Format.varint(0)
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_front_coded_strings(data, 1)
+      CDX::Backends::RbCDX::Format.decode_front_coded_strings(data, 1)
     end
     assert_match(/prefix exceeds previous string length/, error.message)
   end
 
   def test_unpack_unsigned_rejects_truncated_column
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.unpack_unsigned([8, 1].pack("CC"), 2)
+      CDX::Backends::RbCDX::Format.unpack_unsigned([8, 1].pack("CC"), 2)
     end
 
     assert_match(/packed integer column is truncated/, error.message)
   end
 
   def test_unpack_unsigned_rejects_trailing_bytes
-    data = CDX::RbcdxFormat.pack_unsigned([1])
+    data = CDX::Backends::RbCDX::Format.pack_unsigned([1])
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.unpack_unsigned(data + "\0".b, 1)
+      CDX::Backends::RbCDX::Format.unpack_unsigned(data + "\0".b, 1)
     end
 
     assert_match(/packed integer column has trailing bytes/, error.message)
@@ -87,7 +87,7 @@ class RbcdxFormatTest < Minitest::Test
     data = [0, 0].pack("L<S<")
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_directory(data)
+      CDX::Backends::RbCDX::Format.decode_directory(data)
     end
 
     assert_match(/directory has zero restart interval/, error.message)
@@ -95,11 +95,11 @@ class RbcdxFormatTest < Minitest::Test
 
   def test_decode_directory_rejects_truncated_block_record
     data = [1, 1].pack("L<S<")
-    data << CDX::RbcdxFormat.varint(0) << CDX::RbcdxFormat.varint(1) << "a"
-    data << CDX::RbcdxFormat.varint(0) << CDX::RbcdxFormat.varint(1) << "a"
+    data << CDX::Backends::RbCDX::Format.varint(0) << CDX::Backends::RbCDX::Format.varint(1) << "a"
+    data << CDX::Backends::RbCDX::Format.varint(0) << CDX::Backends::RbCDX::Format.varint(1) << "a"
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_directory(data)
+      CDX::Backends::RbCDX::Format.decode_directory(data)
     end
 
     assert_match(/directory block record is truncated/, error.message)
@@ -109,7 +109,7 @@ class RbcdxFormatTest < Minitest::Test
     data = [0, 1].pack("L<S<") + "x"
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_directory(data)
+      CDX::Backends::RbCDX::Format.decode_directory(data)
     end
 
     assert_match(/directory section has trailing bytes/, error.message)
@@ -119,7 +119,7 @@ class RbcdxFormatTest < Minitest::Test
     data = [1].pack("L<") + [2].pack("S<") + "x"
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_dictionaries(data)
+      CDX::Backends::RbCDX::Format.decode_dictionaries(data)
     end
 
     assert_match(/dictionary table name is truncated/, error.message)
@@ -129,7 +129,7 @@ class RbcdxFormatTest < Minitest::Test
     data = [0].pack("L<") + "x"
 
     error = assert_raises(CDX::Error) do
-      CDX::RbcdxFormat.decode_dictionaries(data)
+      CDX::Backends::RbCDX::Format.decode_dictionaries(data)
     end
 
     assert_match(/dictionary section has trailing bytes/, error.message)
@@ -140,14 +140,14 @@ class RbcdxFormatTest < Minitest::Test
       path = File.join(dir, "out.rbcdx")
 
       error = assert_raises(CDX::Error) do
-        CDX::RbcdxFormat.write_file(
+        CDX::Backends::RbCDX::Format.write_file(
           path,
           dict_data: +"dict".b,
           directory_data: +"directory".b,
           hot_data: +"hot".b,
           cold_data: +"cold".b,
           header: {
-            "version" => CDX::RbcdxFormat::VERSION,
+            "version" => CDX::Backends::RbCDX::Format::VERSION,
             "unstable" => ExpandingJsonValue.new
           }
         )

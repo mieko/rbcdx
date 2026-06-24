@@ -1,12 +1,12 @@
 require_relative "test_helper"
 
-class RbcdxManifestTest < Minitest::Test
+class RbCDXManifestTest < Minitest::Test
   def test_builds_file_level_manifest_for_rbcdx_files
     Dir.mktmpdir do |dir|
       first = repack_fixture(dir, "cdx-00001.rbcdx", first_cdxj)
       second = repack_fixture(dir, "cdx-00000.rbcdx", second_cdxj)
 
-      manifest = CDX::RbcdxManifest.build([first, second], root: dir, created_at: 123)
+      manifest = CDX::Backends::RbCDX::Manifest.build([first, second], root: dir, created_at: 123)
 
       assert_equal "rbcdx-manifest", manifest.to_h.fetch("format")
       assert_equal 1, manifest.to_h.fetch("version")
@@ -19,24 +19,24 @@ class RbcdxManifestTest < Minitest::Test
       assert_equal ["com,alpha)/page", "com,zeta)/page"], files.map { |entry| entry.fetch("last_urlkey") }
       assert_equal [2, 2], files.map { |entry| entry.fetch("record_count") }
       assert_equal [2, 2], files.map { |entry| entry.fetch("block_count") }
-      assert_equal [CDX::RbcdxFormat::VERSION, CDX::RbcdxFormat::VERSION], files.map { |entry| entry.fetch("version") }
-      assert_equal [CDX::RbcdxFormat::VARIANT, CDX::RbcdxFormat::VARIANT], files.map { |entry| entry.fetch("variant") }
+      assert_equal [CDX::Backends::RbCDX::Format::VERSION, CDX::Backends::RbCDX::Format::VERSION], files.map { |entry| entry.fetch("version") }
+      assert_equal [CDX::Backends::RbCDX::Format::VARIANT, CDX::Backends::RbCDX::Format::VARIANT], files.map { |entry| entry.fetch("variant") }
       assert files.all? { |entry| entry.fetch("bytes").positive? }
       refute files.any? { |entry| entry.key?("mtime") }
     end
   end
 
   def test_write_uses_visible_manifest_filename
-    refute_match(/\A\./, CDX::RbcdxManifest::FILENAME)
+    refute_match(/\A\./, CDX::Backends::RbCDX::Manifest::FILENAME)
 
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
 
-      manifest = CDX::RbcdxManifest.write([input], output, created_at: 456)
+      manifest = CDX::Backends::RbCDX::Manifest.write([input], output, created_at: 456)
       parsed = JSON.parse(File.read(output))
 
-      assert_instance_of CDX::RbcdxManifest, manifest
+      assert_instance_of CDX::Backends::RbCDX::Manifest, manifest
       assert_equal "rbcdx-manifest", parsed.fetch("format")
       assert_equal 456, parsed.fetch("created_at")
       assert_equal ["cdx-00000.rbcdx"], parsed.fetch("files").map { |entry| entry.fetch("path") }
@@ -48,7 +48,7 @@ class RbcdxManifestTest < Minitest::Test
       repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
       File.write(File.join(dir, "notes.txt"), "not an index\n")
 
-      manifest = CDX::RbcdxManifest.build(dir, created_at: 789)
+      manifest = CDX::Backends::RbCDX::Manifest.build(dir, created_at: 789)
 
       assert_equal ["cdx-00000.rbcdx"], manifest.to_h.fetch("files").map { |entry| File.basename(entry.fetch("path")) }
     end
@@ -57,10 +57,10 @@ class RbcdxManifestTest < Minitest::Test
   def test_read_resolves_relative_paths_from_manifest_location
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
-      CDX::RbcdxManifest.write([input], output, created_at: 456)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
+      CDX::Backends::RbCDX::Manifest.write([input], output, created_at: 456)
 
-      manifest = CDX::RbcdxManifest.read(output, paths: [input])
+      manifest = CDX::Backends::RbCDX::Manifest.read(output, paths: [input])
 
       assert_equal [input], manifest.paths
       assert_equal [input], manifest.candidate_paths("com,zeta)/", prefix: true)
@@ -71,10 +71,10 @@ class RbcdxManifestTest < Minitest::Test
   def test_read_keeps_current_absolute_path_manifest_entry
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
-      CDX::RbcdxManifest.build([input], root: nil, created_at: 456).write(output)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
+      CDX::Backends::RbCDX::Manifest.build([input], root: nil, created_at: 456).write(output)
 
-      manifest = CDX::RbcdxManifest.read(output, paths: [input])
+      manifest = CDX::Backends::RbCDX::Manifest.read(output, paths: [input])
 
       assert_equal [input], manifest.paths
       assert_equal [input], manifest.candidate_paths("com,zeta)/", prefix: true)
@@ -84,11 +84,11 @@ class RbcdxManifestTest < Minitest::Test
   def test_read_keeps_entry_when_mtime_changes
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
-      CDX::RbcdxManifest.write([input], output, created_at: 456)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
+      CDX::Backends::RbCDX::Manifest.write([input], output, created_at: 456)
       File.utime(Time.now + 60, Time.now + 60, input)
 
-      manifest = CDX::RbcdxManifest.read(output, paths: [input])
+      manifest = CDX::Backends::RbCDX::Manifest.read(output, paths: [input])
 
       assert_equal [input], manifest.paths
     end
@@ -97,11 +97,11 @@ class RbcdxManifestTest < Minitest::Test
   def test_read_drops_entry_when_size_changes
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
-      CDX::RbcdxManifest.write([input], output, created_at: 456)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
+      CDX::Backends::RbCDX::Manifest.write([input], output, created_at: 456)
       File.binwrite(input, File.binread(input) + "x")
 
-      manifest = CDX::RbcdxManifest.read(output, paths: [input])
+      manifest = CDX::Backends::RbCDX::Manifest.read(output, paths: [input])
 
       assert_empty manifest.paths
     end
@@ -110,8 +110,8 @@ class RbcdxManifestTest < Minitest::Test
   def test_read_drops_entry_when_current_bounds_change_at_same_size
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
-      CDX::RbcdxManifest.write([input], output, created_at: 456)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
+      CDX::Backends::RbCDX::Manifest.write([input], output, created_at: 456)
 
       replacement_dir = File.join(dir, "replacement")
       FileUtils.mkdir_p(replacement_dir)
@@ -121,7 +121,7 @@ class RbcdxManifestTest < Minitest::Test
       manifest_data.fetch("files").first["bytes"] = File.size(input)
       File.write(output, "#{JSON.pretty_generate(manifest_data)}\n")
 
-      manifest = CDX::RbcdxManifest.read(output, paths: [input])
+      manifest = CDX::Backends::RbCDX::Manifest.read(output, paths: [input])
 
       assert_empty manifest.paths
       assert_equal ["https://alpha.com/"], CDX::Index.open(input).captures("alpha.com/").map(&:url)
@@ -131,11 +131,11 @@ class RbcdxManifestTest < Minitest::Test
   def test_read_keeps_entry_when_current_file_has_invalid_directory_bounds
     Dir.mktmpdir do |dir|
       input = repack_fixture(dir, "cdx-00000.rbcdx", first_cdxj)
-      output = File.join(dir, CDX::RbcdxManifest::FILENAME)
-      CDX::RbcdxManifest.write([input], output, created_at: 456)
+      output = File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME)
+      CDX::Backends::RbCDX::Manifest.write([input], output, created_at: 456)
       rewrite_rbcdx_header(input) { |header| header["directory_offset"] = -1 }
 
-      manifest = CDX::RbcdxManifest.read(output, paths: [input])
+      manifest = CDX::Backends::RbCDX::Manifest.read(output, paths: [input])
 
       assert_equal [input], manifest.paths
     end
@@ -147,7 +147,7 @@ class RbcdxManifestTest < Minitest::Test
       File.write(path, "not rbcdx")
 
       error = assert_raises(ArgumentError) do
-        CDX::RbcdxManifest.build(path)
+        CDX::Backends::RbCDX::Manifest.build(path)
       end
 
       assert_match(/not an rbcdx file/, error.message)
@@ -166,8 +166,8 @@ class RbcdxManifestTest < Minitest::Test
 
   def rewrite_rbcdx_header(path)
     File.open(path, "r+b") do |file|
-      magic = file.read(CDX::RbcdxFormat::MAGIC.bytesize)
-      raise "invalid test rbcdx magic" unless magic == CDX::RbcdxFormat::MAGIC
+      magic = file.read(CDX::Backends::RbCDX::Format::MAGIC.bytesize)
+      raise "invalid test rbcdx magic" unless magic == CDX::Backends::RbCDX::Format::MAGIC
 
       header_length = file.read(4).unpack1("L<")
       header_offset = file.pos

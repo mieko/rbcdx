@@ -1,7 +1,7 @@
 # rbcdx File Format
 
 This document describes the current packed rbcdx index format emitted by
-`CDX::Repacker` and read by `CDX::Backends::Rbcdx`.
+`CDX::Repacker` and read by `CDX::Backends::RbCDX`.
 
 The current on-disk variant is `v3a`. Files conventionally use the `.rbcdx`
 extension, but the magic string and header identify the actual format.

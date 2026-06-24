@@ -1,49 +1,104 @@
+require "uri"
+
 module CDX
   module RepackFilters
-    Record = Struct.new(:source_path, :line_number, :urlkey, :timestamp, :fields) do
-      def [](field)
-        case field.to_s
-        when "urlkey"
-          urlkey
-        when "timestamp"
-          timestamp
-        else
-          fields[field.to_s]
-        end
-      end
+    TEXT_LIKE_MIME_TYPES = %w[
+      text/plain
+      text/html
+      text/xml
+      application/xml
+      application/xhtml+xml
+      application/rss+xml
+      application/atom+xml
+      application/rdf+xml
+      text/markdown
+      text/x-markdown
+      text/x-web-markdown
+    ].freeze
 
-      def fetch(field, *fallback, &block)
-        return self[field] if key?(field)
-        return fallback.first unless fallback.empty?
-        return yield field if block
+    XML_LIKE_MIME_TYPES = %w[
+      text/xml
+      application/xml
+    ].freeze
 
-        raise KeyError, "key not found: #{field.inspect}"
-      end
+    ASSET_MIME_TYPES = %w[
+      application/javascript
+      application/ecmascript
+      application/font-woff
+      application/font-woff2
+      application/pdf
+      application/vnd.ms-fontobject
+      application/x-font-ttf
+      application/x-javascript
+      image/svg+xml
+      text/css
+      text/javascript
+      text/ecmascript
+    ].freeze
 
-      def key?(field)
-        %w[urlkey timestamp].include?(field.to_s) || fields.key?(field.to_s)
-      end
+    ASSET_MIME_PREFIXES = %w[
+      audio/
+      font/
+      image/
+      video/
+    ].freeze
 
-      def to_h
-        fields.merge(
-          "urlkey" => urlkey,
-          "timestamp" => timestamp
-        )
-      end
+    ASSET_PATH_EXTENSIONS = %w[
+      .7z
+      .avi
+      .avif
+      .bmp
+      .br
+      .css
+      .eot
+      .gif
+      .gz
+      .ico
+      .jpeg
+      .jpg
+      .js
+      .json
+      .map
+      .mjs
+      .mov
+      .mp3
+      .mp4
+      .otf
+      .pdf
+      .png
+      .rar
+      .svg
+      .tar
+      .tgz
+      .ttf
+      .wasm
+      .webm
+      .webp
+      .woff
+      .woff2
+      .zip
+    ].freeze
 
-      def field(field)
-        self[CDX::Capture.field_name_for(field)]
-      end
-    end
+    SITE_METADATA_BASENAMES = %w[
+      ads.txt
+      app-ads.txt
+      browserconfig.xml
+      humans.txt
+      manifest.json
+      opensearch.xml
+      robots.txt
+      security.txt
+      site.webmanifest
+    ].freeze
 
     DEFAULT_REGISTRY = {
-      "status-200" => ->(record) { record["status"].to_s == "200" },
-      "html" => lambda { |record|
-        [record["mime"], record["mime-detected"]].compact.any? do |mime|
-          mime.to_s.split(";", 2).first == "text/html"
-        end
-      },
-      "warc" => ->(record) { record["filename"].to_s.include?("/warc/") }
+      "status-200" => ->(record) { record.status.to_s == "200" },
+      "html" => ->(record) { RepackFilters.mime_types(record).include?("text/html") },
+      "text-like" => ->(record) { RepackFilters.text_like?(record) },
+      "asset-like" => ->(record) { RepackFilters.asset_like?(record) },
+      "site-metadata" => ->(record) { RepackFilters.site_metadata?(record) },
+      "warc" => ->(record) { RepackFilters.warc?(record) },
+      "extractable-text" => ->(record) { RepackFilters.extractable_text?(record) }
     }.freeze
 
     module_function
@@ -119,8 +174,61 @@ module CDX
       registry.keys.sort
     end
 
-    def record(source_path:, line_number:, urlkey:, timestamp:, fields:)
-      Record.new(source_path, line_number, urlkey, timestamp, fields.freeze)
+    def extractable_text?(record)
+      record.status.to_s == "200" &&
+        warc?(record) &&
+        text_like?(record) &&
+        !asset_like?(record) &&
+        !site_metadata?(record)
+    end
+
+    def text_like?(record)
+      mime_types(record).any? { |mime| TEXT_LIKE_MIME_TYPES.include?(mime) }
+    end
+
+    def asset_like?(record)
+      mime_types(record).any? { |mime| asset_mime_type?(mime) } ||
+        ASSET_PATH_EXTENSIONS.include?(File.extname(url_path(record)).downcase)
+    end
+
+    def asset_mime_type?(mime)
+      ASSET_MIME_TYPES.include?(mime) ||
+        ASSET_MIME_PREFIXES.any? { |prefix| mime.start_with?(prefix) }
+    end
+
+    def site_metadata?(record)
+      path = url_path(record)
+      basename = File.basename(path).downcase
+      SITE_METADATA_BASENAMES.include?(basename) ||
+        sitemap?(basename, record) ||
+        path.downcase.start_with?("/.well-known/")
+    end
+
+    def sitemap?(basename, record)
+      return false unless basename.include?("sitemap")
+
+      basename.match?(/\.xml(?:\.gz)?\z/) || mime_types(record).any? { |mime| xml_like_mime_type?(mime) }
+    end
+
+    def xml_like_mime_type?(mime)
+      XML_LIKE_MIME_TYPES.include?(mime) || mime.end_with?("+xml")
+    end
+
+    def warc?(record)
+      record.filename.to_s.include?("/warc/")
+    end
+
+    def mime_types(record)
+      [record.mime, record.mime_detected]
+        .compact
+        .map { |mime| mime.to_s.split(";", 2).first.to_s.strip.downcase }
+        .reject(&:empty?)
+    end
+
+    def url_path(record)
+      URI.parse(record.url.to_s).path.to_s
+    rescue URI::InvalidURIError
+      record.url.to_s.split(/[?#]/, 2).first.to_s
     end
 
     def keep?(filters, record)

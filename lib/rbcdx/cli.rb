@@ -6,9 +6,16 @@ module CDX
   class CLI
     FORMATS = %w[jsonl text csv].freeze
     DATA_FORMATS = %w[text jsonl].freeze
+    REPACK_LOG_FORMAT = "rbcdx-repack-log"
+    REPACK_LOG_VERSION = 1
+    REPACK_LOG_FILENAME = "rbcdx-repack-log.json"
+    RepackPlanEntry = Struct.new(:input_path, :output_path)
 
     def self.start(argv = ARGV, out: $stdout, err: $stderr, data_client: nil)
       new(argv.dup, out: out, err: err, data_client: data_client).run
+    rescue Interrupt
+      err.puts "rbcdx: interrupted"
+      130
     rescue ArgumentError, Error, OptionParser::ParseError => error
       err.puts "rbcdx: #{error.message}"
       1
@@ -19,6 +26,7 @@ module CDX
       @out = out
       @err = err
       @data_client = data_client || CommonCrawlData.new
+      @repack_log_loaded = false
     end
 
     def run
@@ -92,10 +100,10 @@ module CDX
       options = parse_repack_options
       return show_help(options) if options[:help]
 
-      if options[:output_dir]
-        run_repack_many(options)
-      else
+      if options[:output]
         run_repack_one(options)
+      else
+        run_repack_many(options)
       end
     end
 
@@ -103,50 +111,89 @@ module CDX
       raise ArgumentError, "choose --output or --output-dir, not both" if options[:output] && options[:output_dir]
       raise ArgumentError, "--delete-when-processed requires --output-dir" if options[:delete_when_processed]
       raise ArgumentError, "--resume requires --output-dir" if options[:resume]
-      raise ArgumentError, "--dry-run requires --output-dir" if options[:dry_run]
 
       input = @argv.shift
       raise ArgumentError, "missing input CDXJ path" unless input
       raise ArgumentError, "options must appear before the input path: #{@argv.join(" ")}" unless @argv.empty?
       raise ArgumentError, "provide --output PATH or --output-dir DIR" unless options[:output]
 
+      if options[:dry_run]
+        preview = CDX::Repacker.preview(
+          input,
+          options.fetch(:output),
+          output_format: options.fetch(:output_format, "rbcdx"),
+          block_bytes: options.fetch(:block_bytes, CDX::Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES),
+          max_records: options.fetch(:max_records, CDX::Backends::RbCDX::Format::DEFAULT_MAX_RECORDS),
+          restart_interval: options.fetch(:restart_interval, CDX::Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL),
+          zstd_level: options.fetch(:zstd_level, 6),
+          filters: options.fetch(:filters),
+          where: options.fetch(:where),
+          force: options.fetch(:force, false)
+        )
+        entry = RepackPlanEntry.new(File.expand_path(input), File.expand_path(options.fetch(:output)))
+        progress = RepackProgress.new(@out)
+        progress.call(:planned, entry: entry, index: 1, total: 1)
+        progress.call(:preview, entry: entry, index: 1, total: 1, preview: preview)
+        return 0
+      end
+
+      entry = RepackPlanEntry.new(File.expand_path(input), File.expand_path(options.fetch(:output)))
+      progress = RepackProgress.new(@err)
+      progress.call(:start, entry: entry, index: 1, total: 1)
       result = CDX::Repacker.repack(
         input,
         options.fetch(:output),
-        block_bytes: options.fetch(:block_bytes, RbcdxFormat::DEFAULT_BLOCK_BYTES),
-        max_records: options.fetch(:max_records, RbcdxFormat::DEFAULT_MAX_RECORDS),
-        restart_interval: options.fetch(:restart_interval, RbcdxFormat::DEFAULT_RESTART_INTERVAL),
+        output_format: options.fetch(:output_format, "rbcdx"),
+        block_bytes: options.fetch(:block_bytes, CDX::Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES),
+        max_records: options.fetch(:max_records, CDX::Backends::RbCDX::Format::DEFAULT_MAX_RECORDS),
+        restart_interval: options.fetch(:restart_interval, CDX::Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL),
         zstd_level: options.fetch(:zstd_level, 6),
         filters: options.fetch(:filters),
         where: options.fetch(:where),
         force: options.fetch(:force, false)
       )
+      progress.call(:finish, entry: entry, index: 1, total: 1)
       @out.puts result.path
       0
+    rescue
+      progress&.call(:fail, entry: entry, index: 1, total: 1)
+      raise
     end
 
     def run_repack_many(options)
       raise ArgumentError, "choose --output or --output-dir, not both" if options[:output]
-      inputs = @argv.dup
-      raise ArgumentError, "missing input CDXJ path" if inputs.empty?
+      apply_repack_log!(options)
+      inputs = @argv.empty? ? ["."] : @argv.dup
 
       progress_io = options[:dry_run] ? @out : @err
-      results = CDX::Repacker.repack_many(
-        inputs,
-        output_dir: options.fetch(:output_dir),
-        block_bytes: options.fetch(:block_bytes, RbcdxFormat::DEFAULT_BLOCK_BYTES),
-        max_records: options.fetch(:max_records, RbcdxFormat::DEFAULT_MAX_RECORDS),
-        restart_interval: options.fetch(:restart_interval, RbcdxFormat::DEFAULT_RESTART_INTERVAL),
-        zstd_level: options.fetch(:zstd_level, 6),
-        filters: options.fetch(:filters),
-        where: options.fetch(:where),
-        resume: options.fetch(:resume, false),
-        force: options.fetch(:force, false),
-        dry_run: options.fetch(:dry_run, false),
-        delete_when_processed: options.fetch(:delete_when_processed, false),
-        manifest: options.fetch(:manifest, true),
-        progress: RepackProgress.new(progress_io)
-      )
+      log_path = nil
+      results = begin
+        log_path = prepare_repack_log(options, inputs) unless options[:dry_run]
+        CDX::Repacker.repack_many(
+          inputs,
+          output_dir: options.fetch(:output_dir, "."),
+          output_format: options.fetch(:output_format, "rbcdx"),
+          block_bytes: options.fetch(:block_bytes, CDX::Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES),
+          max_records: options.fetch(:max_records, CDX::Backends::RbCDX::Format::DEFAULT_MAX_RECORDS),
+          restart_interval: options.fetch(:restart_interval, CDX::Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL),
+          zstd_level: options.fetch(:zstd_level, 6),
+          filters: options.fetch(:filters),
+          where: options.fetch(:where),
+          resume: options.fetch(:resume, false),
+          force: options.fetch(:force, false),
+          dry_run: options.fetch(:dry_run, false),
+          delete_when_processed: options.fetch(:delete_when_processed, false),
+          manifest: options.fetch(:manifest, true),
+          progress: RepackProgress.new(progress_io)
+        )
+      rescue Interrupt
+        report_repack_resume(log_path)
+        raise
+      rescue
+        report_repack_resume(log_path)
+        raise
+      end
+      remove_repack_log(log_path)
       results.each { |result| @out.puts result.output_path } unless options[:dry_run]
       0
     end
@@ -330,6 +377,7 @@ module CDX
       options = {
         filters: [],
         where: [],
+        output_format: "rbcdx",
         manifest: true
       }
 
@@ -338,11 +386,14 @@ module CDX
         opts.on("-h", "--help", "Show help") do
           options[:help] = opts
         end
-        opts.on("--output PATH", "Path for the .rbcdx output") do |output|
+        opts.on("--output PATH", "Path for the output") do |output|
           options[:output] = output
         end
-        opts.on("--output-dir DIR", "Directory for batch .rbcdx outputs") do |output_dir|
+        opts.on("--output-dir DIR", "Directory for batch outputs") do |output_dir|
           options[:output_dir] = output_dir
+        end
+        opts.on("--output-format FORMAT", "Output format: rbcdx or cdxj") do |output_format|
+          options[:output_format] = output_format
         end
         opts.on("--block-bytes N", Integer, "Source bytes per compressed block") do |block_bytes|
           options[:block_bytes] = block_bytes
@@ -368,10 +419,10 @@ module CDX
         opts.on("--force", "Overwrite outputs and batch state") do
           options[:force] = true
         end
-        opts.on("--dry-run", "Print planned batch outputs without writing files") do
+        opts.on("--dry-run", "Preview repack outputs and filter counts without writing files") do
           options[:dry_run] = true
         end
-        opts.on("--delete-when-processed", "Delete each source after verified batch output") do
+        opts.on("--delete-when-processed", "Delete each source after written batch output") do
           options[:delete_when_processed] = true
         end
         opts.on("--[no-]manifest", "Write rbcdx-manifest.json for batch outputs") do |manifest|
@@ -380,6 +431,8 @@ module CDX
       end
 
       parser.order!(@argv)
+      validate_repack_output_format!(options.fetch(:output_format))
+      validate_cdxj_repack_options!(options) if options.fetch(:output_format) == "cdxj"
       validate_positive_integer!(options[:block_bytes], "--block-bytes") if options[:block_bytes]
       validate_positive_integer!(options[:max_records], "--max-records") if options[:max_records]
       validate_positive_integer!(options[:restart_interval], "--restart-interval") if options[:restart_interval]
@@ -454,13 +507,177 @@ module CDX
       raise ArgumentError, "#{option} must be greater than 0" unless value.positive?
     end
 
+    def validate_repack_output_format!(format)
+      return if CDX::Repacker.output_formats.include?(format.to_s)
+
+      raise ArgumentError, "unsupported output format: #{format.inspect}"
+    end
+
+    def validate_cdxj_repack_options!(options)
+      {
+        block_bytes: "--block-bytes",
+        max_records: "--max-records",
+        restart_interval: "--restart-interval",
+        zstd_level: "--zstd-level"
+      }.each do |key, flag|
+        raise ArgumentError, "#{flag} only applies to --output-format rbcdx" if options.key?(key)
+      end
+    end
+
+    def apply_repack_log!(options)
+      return unless options[:resume]
+      if options[:output_dir] || !@argv.empty?
+        raise Error, "repack --resume uses #{REPACK_LOG_FILENAME}; run `rbcdx repack --resume` without input paths or --output-dir"
+      end
+      unless File.file?(repack_log_path)
+        raise Error, "no repack log found; rerun the original repack command to start a new batch: #{repack_log_path}"
+      end
+
+      log = read_repack_log
+      @repack_log_loaded = true
+      @err.puts "resuming from #{repack_log_path}"
+      request = log["request"]
+      unless request.is_a?(Hash)
+        raise Error, "#{repack_log_path}: invalid repack log request"
+      end
+      inputs = request["inputs"]
+      unless inputs.is_a?(Array)
+        raise Error, "#{repack_log_path}: invalid repack log inputs"
+      end
+      unless !inputs.empty? && inputs.all? { |input| input.is_a?(String) && !input.empty? }
+        raise Error, "#{repack_log_path}: invalid repack log input path"
+      end
+      log_options = request["options"]
+      unless log_options.is_a?(Hash)
+        raise Error, "#{repack_log_path}: invalid repack log options"
+      end
+      output_dir = log_options["output_dir"]
+      unless output_dir.is_a?(String) && !output_dir.empty?
+        raise Error, "#{repack_log_path}: invalid repack log output_dir"
+      end
+      output_format = log_options.fetch("output_format", "rbcdx")
+      unless output_format.is_a?(String)
+        raise Error, "#{repack_log_path}: invalid repack log output_format"
+      end
+      filters = log_options.fetch("filters", [])
+      unless filters.is_a?(Array) && filters.all? { |filter| filter.is_a?(String) }
+        raise Error, "#{repack_log_path}: invalid repack log filters"
+      end
+      where = log_options.fetch("where", [])
+      unless where.is_a?(Array) && where.all? { |filter| filter.is_a?(String) }
+        raise Error, "#{repack_log_path}: invalid repack log where"
+      end
+      delete_when_processed = log_options.fetch("delete_when_processed", false)
+      unless delete_when_processed == true || delete_when_processed == false
+        raise Error, "#{repack_log_path}: invalid repack log delete_when_processed"
+      end
+      manifest = log_options.fetch("manifest", true)
+      unless manifest == true || manifest == false
+        raise Error, "#{repack_log_path}: invalid repack log manifest"
+      end
+
+      @argv.replace(inputs)
+      options[:output_dir] = output_dir
+      options[:output_format] = output_format
+      options[:block_bytes] = log_options["block_bytes"] if log_options.key?("block_bytes")
+      options[:max_records] = log_options["max_records"] if log_options.key?("max_records")
+      options[:restart_interval] = log_options["restart_interval"] if log_options.key?("restart_interval")
+      options[:zstd_level] = log_options["zstd_level"] if log_options.key?("zstd_level")
+      options[:filters] = filters
+      options[:where] = where
+      options[:delete_when_processed] = delete_when_processed
+      options[:manifest] = manifest
+    end
+
+    def prepare_repack_log(options, inputs)
+      path = repack_log_path
+      return path if @repack_log_loaded
+      return nil if options[:resume]
+
+      if File.file?(path) && !options[:resume] && !options[:force]
+        raise Error, "repack log already exists; use --resume to continue or --force to start over: #{path}"
+      end
+
+      write_repack_log(path, options, inputs)
+      @err.puts "created resume log #{path}"
+      @err.puts "if interrupted, run: rbcdx repack --resume"
+      path
+    end
+
+    def write_repack_log(path, options, inputs)
+      data = {
+        "format" => REPACK_LOG_FORMAT,
+        "version" => REPACK_LOG_VERSION,
+        "created_at" => Time.now.to_i,
+        "updated_at" => Time.now.to_i,
+        "state_path" => File.join(File.expand_path(options.fetch(:output_dir, ".")), CDX::BatchRepacker::STATE_FILENAME),
+        "request" => {
+          "cwd" => Dir.pwd,
+          "inputs" => inputs.map { |input| File.expand_path(input) },
+          "options" => repack_log_options(options)
+        }
+      }
+      atomic_write_json(path, data)
+    end
+
+    def read_repack_log
+      data = JSON.parse(File.read(repack_log_path))
+      raise Error, "#{repack_log_path}: invalid repack log format" unless data.is_a?(Hash) && data["format"] == REPACK_LOG_FORMAT
+      raise Error, "#{repack_log_path}: unsupported repack log version #{data["version"]}" unless data["version"] == REPACK_LOG_VERSION
+
+      data
+    rescue JSON::ParserError => error
+      raise Error, "#{repack_log_path}: malformed repack log JSON: #{error.message}"
+    end
+
+    def remove_repack_log(path)
+      return unless path && File.file?(path)
+
+      File.delete(path)
+      @err.puts "removed resume log #{path}"
+    end
+
+    def report_repack_resume(path)
+      return unless path && File.file?(path)
+
+      @err.puts "resume log kept #{path}"
+      @err.puts "resume with: rbcdx repack --resume"
+    end
+
+    def repack_log_options(options)
+      {
+        "output_dir" => File.expand_path(options.fetch(:output_dir, ".")),
+        "output_format" => options.fetch(:output_format, "rbcdx"),
+        "block_bytes" => options[:block_bytes],
+        "max_records" => options[:max_records],
+        "restart_interval" => options[:restart_interval],
+        "zstd_level" => options[:zstd_level],
+        "filters" => options.fetch(:filters),
+        "where" => options.fetch(:where),
+        "delete_when_processed" => options.fetch(:delete_when_processed, false),
+        "manifest" => options.fetch(:manifest, true)
+      }.compact
+    end
+
+    def repack_log_path
+      File.join(Dir.pwd, REPACK_LOG_FILENAME)
+    end
+
+    def atomic_write_json(path, data)
+      temp_path = "#{path}.tmp-#{$$}"
+      File.write(temp_path, "#{JSON.pretty_generate(data)}\n")
+      File.rename(temp_path, path)
+    ensure
+      File.delete(temp_path) if temp_path && File.file?(temp_path)
+    end
+
     def usage
       <<~USAGE
         Usage:
           rbcdx captures --index PATH [--limit N] [--filter '=status:200'] URL
           rbcdx count --index PATH URL
           rbcdx repack --output PATH INPUT.cdxj[.gz]
-          rbcdx repack --output-dir DIR INPUT...
+          rbcdx repack [--output-dir DIR] [INPUT...]
           rbcdx data list [--limit N]
           rbcdx data download --output DIR [--crawl CRAWL]
 
@@ -472,22 +689,27 @@ module CDX
       <<~USAGE
         Usage:
           rbcdx repack --output PATH [options] INPUT.cdxj[.gz]
-          rbcdx repack --output-dir DIR [options] INPUT...
+          rbcdx repack [--output-dir DIR] [options] [INPUT...]
+
+        When --output is not given, repack runs in batch mode. The default input
+        and output directory are both the current directory.
+        Batch mode records a resume log; run `rbcdx repack --resume` to continue.
 
         Options:
-          --output PATH           Path for the .rbcdx output
-          --output-dir DIR        Directory for batch .rbcdx outputs
-          --block-bytes N         Source bytes per compressed block
-          --max-records N         Maximum records per compressed block
-          --restart-interval N    Front-coded string restart interval
-          --zstd-level N          Zstandard compression level
+          --output PATH           Path for the output
+          --output-dir DIR        Directory for batch outputs
+          --output-format FORMAT  Output format: rbcdx or cdxj
+          --block-bytes N         Source bytes per compressed block (rbcdx)
+          --max-records N         Maximum records per compressed block (rbcdx)
+          --restart-interval N    Front-coded string restart interval (rbcdx)
+          --zstd-level N          Zstandard compression level (rbcdx)
           --filter EXPR           Filter expression, for example '+status-200,-warc'
           --where FILTER          CDX field filter, for example '=status:200'
           --resume                Resume a batch repack
           --force                 Overwrite outputs and batch state
-          --dry-run               Print planned batch outputs without writing files
-          --delete-when-processed Delete each source after verified batch output
-          --no-manifest           Do not write rbcdx-manifest.json for batch outputs
+          --dry-run               Preview outputs and filter counts without writing files
+          --delete-when-processed Delete each source after written batch output
+          --no-manifest           Do not write rbcdx-manifest.json for rbcdx batch outputs
           -h, --help              Show help
       USAGE
     end
@@ -567,22 +789,30 @@ module CDX
         @io = io
       end
 
-      def call(event, entry:, index:, total:)
-        input = entry.input_path
-        output = entry.output_path
+      def call(event, entry: nil, index: nil, total: nil, preview: nil, path: nil, entries: nil)
         case event
+        when :state_start
+          @io.puts "creating repack state #{path}"
+        when :state_finish
+          @io.puts "created repack state #{path} for #{entries} input(s)"
+        when :state_resume
+          @io.puts "loaded repack state #{path} with #{entries} input(s)"
         when :planned
-          @io.puts "planned [#{index}/#{total}] #{input} -> #{output}"
+          @io.puts "would create [#{index}/#{total}] #{entry.output_path} from #{entry.input_path}"
+        when :delete_planned
+          @io.puts "would delete after written output [#{index}/#{total}] #{entry.input_path}"
+        when :preview
+          @io.puts "filtered [#{index}/#{total}] #{entry.input_path}: #{preview.record_count} of #{preview.total_records} records passed filters"
         when :start
-          @io.puts "processing [#{index}/#{total}] #{input} -> #{output}"
+          @io.puts "processing [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         when :finish
-          @io.puts "written [#{index}/#{total}] #{input} -> #{output}"
+          @io.puts "written [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         when :skip
-          @io.puts "skipped [#{index}/#{total}] #{input} -> #{output}"
+          @io.puts "skipped [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         when :delete
-          @io.puts "deleted [#{index}/#{total}] #{input}"
+          @io.puts "deleted [#{index}/#{total}] #{entry.input_path}"
         when :fail
-          @io.puts "failed [#{index}/#{total}] #{input} -> #{output}"
+          @io.puts "failed [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         end
       end
     end
