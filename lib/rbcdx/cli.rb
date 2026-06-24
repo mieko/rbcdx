@@ -100,7 +100,7 @@ module CDX
       options = parse_repack_options
       return show_help(options) if options[:help]
 
-      if options[:output]
+      if options[:output] && !options[:resume]
         run_repack_one(options)
       else
         run_repack_many(options)
@@ -128,6 +128,7 @@ module CDX
           zstd_level: options.fetch(:zstd_level, 6),
           filters: options.fetch(:filters),
           where: options.fetch(:where),
+          only_url_files: options[:only_url_files],
           collapse: options[:collapse],
           collapse_order: options[:collapse_order],
           force: options.fetch(:force, false)
@@ -152,6 +153,7 @@ module CDX
         zstd_level: options.fetch(:zstd_level, 6),
         filters: options.fetch(:filters),
         where: options.fetch(:where),
+        only_url_files: options[:only_url_files],
         collapse: options[:collapse],
         collapse_order: options[:collapse_order],
         force: options.fetch(:force, false),
@@ -166,8 +168,9 @@ module CDX
     end
 
     def run_repack_many(options)
-      raise ArgumentError, "choose --output or --output-dir, not both" if options[:output]
       apply_repack_log!(options)
+      raise ArgumentError, "choose --output or --output-dir, not both" if options[:output]
+      validate_repack_options!(options)
       inputs = @argv.empty? ? ["."] : @argv.dup
 
       progress_io = options[:dry_run] ? @out : @err
@@ -184,6 +187,7 @@ module CDX
           zstd_level: options.fetch(:zstd_level, 6),
           filters: options.fetch(:filters),
           where: options.fetch(:where),
+          only_url_files: options[:only_url_files],
           collapse: options[:collapse],
           collapse_order: options[:collapse_order],
           resume: options.fetch(:resume, false),
@@ -387,6 +391,7 @@ module CDX
     end
 
     def parse_repack_options
+      filter_expressions = []
       options = {
         filters: [],
         where: [],
@@ -421,10 +426,14 @@ module CDX
           options[:zstd_level] = zstd_level
         end
         opts.on("--filter EXPR", "Filter expression, for example '+status_200,-asset_like'") do |filter|
-          options[:filters].concat(repack_filter_terms(filter))
+          filter_expressions << filter
         end
         opts.on("--where FILTER", "CDX field filter, for example '=status:200'") do |filter|
           options[:where] << filter
+        end
+        opts.on("--only-url-file FILE", "Allow only URL or host/path prefixes listed in FILE") do |file|
+          options[:only_url_files] ||= []
+          options[:only_url_files] << file
         end
         opts.on("--collapse FIELD", "Collapse captures before writing: urlkey") do |collapse|
           options[:collapse] = collapse.to_sym
@@ -450,12 +459,8 @@ module CDX
       end
 
       parser.order!(@argv)
-      validate_repack_output_format!(options.fetch(:output_format))
-      validate_cdxj_repack_options!(options) if options.fetch(:output_format) == "cdxj"
-      validate_positive_integer!(options[:block_bytes], "--block-bytes") if options[:block_bytes]
-      validate_positive_integer!(options[:max_records], "--max-records") if options[:max_records]
-      validate_positive_integer!(options[:restart_interval], "--restart-interval") if options[:restart_interval]
-      validate_positive_integer!(options[:zstd_level], "--zstd-level") if options[:zstd_level]
+      options[:filters] = filter_expressions.flat_map { |filter| repack_filter_terms(filter) } unless options[:resume]
+      validate_repack_options!(options) unless options[:resume]
       options
     end
 
@@ -565,6 +570,15 @@ module CDX
       raise ArgumentError, "unsupported output format: #{format.inspect}"
     end
 
+    def validate_repack_options!(options)
+      validate_repack_output_format!(options.fetch(:output_format))
+      validate_cdxj_repack_options!(options) if options.fetch(:output_format) == "cdxj"
+      validate_positive_integer!(options[:block_bytes], "--block-bytes") if options[:block_bytes]
+      validate_positive_integer!(options[:max_records], "--max-records") if options[:max_records]
+      validate_positive_integer!(options[:restart_interval], "--restart-interval") if options[:restart_interval]
+      validate_positive_integer!(options[:zstd_level], "--zstd-level") if options[:zstd_level]
+    end
+
     def validate_cdxj_repack_options!(options)
       {
         block_bytes: "--block-bytes",
@@ -619,6 +633,16 @@ module CDX
       unless where.is_a?(Array) && where.all? { |filter| filter.is_a?(String) }
         raise Error, "#{repack_log_path}: invalid repack log where"
       end
+      only_url_files = log_options["only_url_files"]
+      if !only_url_files.nil? && !(only_url_files.is_a?(Array) && only_url_files.all? { |file| file.is_a?(String) && !file.empty? })
+        raise Error, "#{repack_log_path}: invalid repack log only_url_files"
+      end
+      only_url_signature = log_options["only_url_signature"]
+      if only_url_files.nil?
+        raise Error, "#{repack_log_path}: invalid repack log only_url_signature" unless only_url_signature.nil?
+      elsif !only_url_signature.is_a?(Hash) || OnlyUrlFilter.from_files(only_url_files).signature != only_url_signature
+        raise Error, "#{repack_log_path}: only-url files changed since the repack log was written"
+      end
       delete_when_processed = log_options.fetch("delete_when_processed", false)
       unless delete_when_processed == true || delete_when_processed == false
         raise Error, "#{repack_log_path}: invalid repack log delete_when_processed"
@@ -637,18 +661,28 @@ module CDX
       end
 
       @argv.replace(inputs)
+      options.delete(:output)
       options[:output_dir] = output_dir
       options[:output_format] = output_format
-      options[:block_bytes] = log_options["block_bytes"] if log_options.key?("block_bytes")
-      options[:max_records] = log_options["max_records"] if log_options.key?("max_records")
-      options[:restart_interval] = log_options["restart_interval"] if log_options.key?("restart_interval")
-      options[:zstd_level] = log_options["zstd_level"] if log_options.key?("zstd_level")
+      restore_optional_log_option!(options, log_options, :block_bytes, "block_bytes")
+      restore_optional_log_option!(options, log_options, :max_records, "max_records")
+      restore_optional_log_option!(options, log_options, :restart_interval, "restart_interval")
+      restore_optional_log_option!(options, log_options, :zstd_level, "zstd_level")
       options[:filters] = filters.flat_map { |filter| repack_filter_terms(filter) }
       options[:where] = where
+      options[:only_url_files] = only_url_files
       options[:delete_when_processed] = delete_when_processed
       options[:manifest] = manifest
       options[:collapse] = collapse&.to_sym
       options[:collapse_order] = collapse_order&.to_sym
+    end
+
+    def restore_optional_log_option!(options, log_options, option_key, log_key)
+      if log_options.key?(log_key)
+        options[option_key] = log_options[log_key]
+      else
+        options.delete(option_key)
+      end
     end
 
     def prepare_repack_log(options, inputs)
@@ -707,7 +741,7 @@ module CDX
     end
 
     def repack_log_options(options)
-      {
+      data = {
         "output_dir" => File.expand_path(options.fetch(:output_dir, ".")),
         "output_format" => options.fetch(:output_format, "rbcdx"),
         "block_bytes" => options[:block_bytes],
@@ -716,11 +750,16 @@ module CDX
         "zstd_level" => options[:zstd_level],
         "filters" => CaptureFilters.stable_terms(options.fetch(:filters), label: "repack filter"),
         "where" => options.fetch(:where),
+        "only_url_files" => options[:only_url_files]&.map { |file| File.expand_path(file) },
         "delete_when_processed" => options.fetch(:delete_when_processed, false),
         "manifest" => options.fetch(:manifest, true),
         "collapse" => options[:collapse]&.to_s,
         "collapse_order" => options[:collapse_order]&.to_s
       }.compact
+      if options[:only_url_files]
+        data["only_url_signature"] = OnlyUrlFilter.from_files(options[:only_url_files]).signature
+      end
+      data
     end
 
     def repack_log_path
@@ -769,6 +808,7 @@ module CDX
           --zstd-level N          Zstandard compression level (rbcdx)
           --filter EXPR           Filter expression, for example '+status_200,-asset_like'
           --where FILTER          CDX field filter, for example '=status:200'
+          --only-url-file FILE    Allow only URL or host/path prefixes listed in FILE
           --collapse FIELD        Collapse captures before writing: urlkey
           --collapse-order ORDER  Collapse order: latest
           --resume                Resume a batch repack

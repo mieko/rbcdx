@@ -113,7 +113,7 @@ Supported URL patterns:
 
 - `example.com/page` matches one canonical page on `http` or `https`
 - `example.com/*` matches that host and path prefix
-- `*.example.com` matches the host and subdomains
+- `*.example.com` matches `example.com` and its subdomains
 
 Useful query options:
 
@@ -385,6 +385,17 @@ rbcdx repack --output-dir ./rbcdx-indexes ./indexes/CC-MAIN-2026-25
 Non-dry-run repacks write progress and resume instructions to stderr. Successful
 output paths are written to stdout, one per line, so scripts can consume them.
 
+Use one or more `--only-url-file` flags when a derived index should include
+only captures from a target host/path list:
+
+```sh
+rbcdx repack --output-dir ./rbcdx-news --filter extractable_text --only-url-file ./targets.txt ./indexes/CC-MAIN-2026-25
+```
+
+Allow-list entries can be full URLs or bare host/path prefixes. URL schemes are
+ignored. Exact hosts do not include subdomains; `*.example.com` includes both
+`example.com` and its subdomains.
+
 When you only need one representative capture per URL key, repack can write a
 smaller derived index:
 
@@ -403,8 +414,8 @@ a directory containing both `cdx-*.gz` and `.rbcdx` files should be treated as a
 migration workspace, not as a queryable index.
 
 For query filtering and cursor signatures, see [Querying](doc/query.md). For
-dry-run, resume, repack filtering, same-format output, and single-file repack
-details, see [Repacking](doc/repack.md).
+dry-run, resume, repack filtering, allow-list files, same-format output, and
+single-file repack details, see [Repacking](doc/repack.md).
 
 ## What rbcdx Does Not Do
 

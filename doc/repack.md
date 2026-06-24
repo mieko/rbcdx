@@ -74,8 +74,10 @@ interrupted work can continue without repeating the original arguments:
 rbcdx repack --resume
 ```
 
-The log records the original input paths, output directory, filters, and format.
-It is removed after a successful batch.
+The log records the original input paths, output directory, filters, output
+format, and other plan-bearing options. Resume uses the saved request rather
+than current command-line options; run `rbcdx repack --resume` without input
+paths or `--output-dir`. The log is removed after a successful batch.
 
 ## Filtering
 
@@ -115,6 +117,27 @@ Use `--where` for normal CDX field filters:
 ```sh
 rbcdx repack --output-dir ./rbcdx-200 --where '=status:200' ./indexes/CC-MAIN-2026-25
 ```
+
+Use `--only-url-file` to restrict repack output to captures whose canonical
+host and path match URL or host/path prefixes from one or more files:
+
+```sh
+rbcdx repack --output-dir ./rbcdx-news --only-url-file ./targets.txt ./indexes/CC-MAIN-2026-25
+rbcdx repack --output-dir ./rbcdx-news --only-url-file ./local.txt --only-url-file ./more.txt ./indexes/CC-MAIN-2026-25
+```
+
+Each allow-list file is a line list. Blank lines and lines whose first
+non-space character is `#` are ignored. Entries may be full URLs such as
+`https://example.com/news/`, wildcard host URLs such as
+`https://*.example.com/news/`, or bare host/path prefixes such as
+`example.com/news/`. The URL scheme is ignored, so an `https://` entry can match
+HTTP or HTTPS captures. Host-only entries match all paths for that canonical
+host. Path entries are prefix matches. Exact hosts do not include subdomains;
+`*.example.com` includes both `example.com` and its subdomains.
+
+The canonical deduped allow-list contributes to output filter signatures and
+batch plan signatures. Batch resume reuses the saved expanded file paths and
+rejects changed allow-list contents before continuing.
 
 ## URL-Key Collapse
 
