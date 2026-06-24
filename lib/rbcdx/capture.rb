@@ -1,91 +1,145 @@
 module CDX
   class Capture
-    include Enumerable
+    FIELD_METHODS = {
+      "urlkey" => :urlkey,
+      "timestamp" => :timestamp,
+      "url" => :url,
+      "mime" => :mime,
+      "mime-detected" => :mime_detected,
+      "status" => :status,
+      "digest" => :digest,
+      "redirect" => :redirect,
+      "meta" => :meta,
+      "length" => :length,
+      "offset" => :offset,
+      "filename" => :filename
+    }.freeze
+
+    FIELD_NAMES_BY_METHOD = FIELD_METHODS.invert.freeze
+    BUILTIN_METHOD_OWNERS = [BasicObject, Kernel, Object].freeze
 
     attr_reader :source_path, :line_number
 
-    def initialize(data, source_path: nil, line_number: nil)
+    def self.field_name_for(field)
+      value = field.to_s.strip
+      return "" if value.empty?
+
+      FIELD_NAMES_BY_METHOD.fetch(value.to_sym, value)
+    end
+
+    def self.field_names_for_method(method_name)
+      name = method_name.to_s
+      candidates = []
+      candidates << FIELD_NAMES_BY_METHOD[method_name.to_sym]
+      candidates << name
+      candidates << name.tr("_", "-") if name.include?("_")
+      candidates.compact.uniq
+    end
+
+    def self.method_name_for(field)
+      field_name = field_name_for(field)
+      return if field_name.empty?
+
+      method_name = FIELD_METHODS.fetch(field_name, field_name.tr("-", "_").to_sym)
+      method_name if method_name.to_s.match?(/\A[a-z_]\w*[!?]?\z/)
+    end
+
+    def self.known_field?(field)
+      FIELD_METHODS.key?(field_name_for(field))
+    end
+
+    def self.normalize_field_names(fields)
+      fields.flatten.flat_map { |field| field.to_s.split(",") }
+        .map { |field| field_name_for(field) }
+        .reject(&:empty?)
+    end
+
+    def initialize(data, source_path: nil, line_number: nil, fields: nil)
       @data = data.each_with_object({}) do |(key, value), normalized|
         normalized[key.to_s] = value
       end
+      @field_names = self.class.normalize_field_names(fields || @data.keys)
       @source_path = source_path
       @line_number = line_number
     end
 
-    def [](key)
-      @data[key.to_s]
-    end
-
-    def fetch(key, *default, &block)
-      @data.fetch(key.to_s, *default, &block)
-    end
-
-    def key?(key)
-      @data.key?(key.to_s)
-    end
-    alias_method :has_key?, :key?
-
-    def each
-      return enum_for(:each) unless block_given?
-
-      @data.each { |key, value| yield key, value }
-      self
-    end
-
     def to_h
-      @data.dup
-    end
-    alias_method :fields, :to_h
+      @field_names.each_with_object({}) do |field, result|
+        next unless field_materializable?(field)
 
-    def slice(*fields)
-      wanted = fields.flatten.flat_map { |field| field.to_s.split(",") }.map(&:strip).reject(&:empty?)
-      wanted.each_with_object({}) do |field, result|
-        result[field] = @data[field] if @data.key?(field)
+        result[field] = self.field(field)
       end
     end
 
     def with_fields(*fields)
-      self.class.new(slice(*fields), source_path: source_path, line_number: line_number)
+      data = self.class.normalize_field_names(fields).each_with_object({}) do |field, result|
+        next unless field_materializable?(field)
+
+        result[field] = self.field(field)
+      end
+      self.class.new(data, source_path: source_path, line_number: line_number, fields: data.keys)
+    end
+
+    def field(field)
+      field = self.class.field_name_for(field)
+      return if field.empty?
+      return read_field(field) if field_available?(field)
+      return unless method_field_materializable?(field)
+
+      method_name = self.class.method_name_for(field)
+      public_send(method_name)
     end
 
     def revisit?
-      self["mime"] == "warc/revisit" || self["status"] == "-"
+      mime == "warc/revisit" || status == "-"
     end
 
     def urlkey
-      self["urlkey"]
+      read_field("urlkey")
     end
 
     def timestamp
-      self["timestamp"]
+      read_field("timestamp")
     end
 
     def url
-      self["url"]
+      read_field("url")
     end
 
     def status
-      self["status"]
+      read_field("status")
     end
 
     def mime
-      self["mime"]
+      read_field("mime")
     end
 
     def mime_detected
-      self["mime-detected"]
+      read_field("mime-detected")
     end
 
     def digest
-      self["digest"]
+      read_field("digest")
+    end
+
+    def redirect
+      read_field("redirect")
+    end
+
+    def meta
+      read_field("meta")
     end
 
     def filename
-      self["filename"]
+      read_field("filename")
     end
 
     def offset
-      self["offset"]
+      read_field("offset")
+    end
+
+    def length
+      read_field("length")
     end
 
     def warc_offset
@@ -93,7 +147,7 @@ module CDX
     end
 
     def warc_length
-      integer_or_nil(self["length"])
+      integer_or_nil(length)
     end
 
     def warc_url(base_url: "https://data.commoncrawl.org")
@@ -110,12 +164,65 @@ module CDX
       start..finish
     end
 
+    def respond_to_missing?(method_name, include_private = false)
+      field_for_method(method_name) || super
+    end
+
     private
 
+    def field_materializable?(field)
+      field = self.class.field_name_for(field)
+      return false if field.empty?
+      return true if field_available?(field)
+
+      method_field_materializable?(field)
+    end
+
+    def method_field_materializable?(field)
+      method_name = self.class.method_name_for(field)
+      return false unless callable_field_method?(method_name)
+
+      method_owner(method_name) != Capture || (self.class != Capture && self.class.known_field?(field))
+    end
+
+    def callable_field_method?(method_name)
+      return false unless method_name && respond_to?(method_name)
+
+      !BUILTIN_METHOD_OWNERS.include?(method_owner(method_name))
+    rescue NameError
+      false
+    end
+
+    def method_owner(method_name)
+      method(method_name).owner
+    end
+
+    def method_missing(method_name, *arguments, &block)
+      field = field_for_method(method_name)
+      return read_field(field) if field && arguments.empty? && block.nil?
+
+      super
+    end
+
+    def field_for_method(method_name)
+      self.class.field_names_for_method(method_name).find { |field| field_available?(field) }
+    end
+
+    def field_available?(field)
+      @data.key?(field.to_s)
+    end
+
+    def read_field(field)
+      @data[field.to_s]
+    end
+
     def integer_or_nil(value)
-      Integer(value)
-    rescue ArgumentError, TypeError
-      nil
+      return if value.nil?
+
+      string = value.to_s
+      return unless string.match?(/\A-?\d+\z/)
+
+      string.to_i
     end
   end
 end

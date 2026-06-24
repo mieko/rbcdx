@@ -23,6 +23,7 @@ Gem::Specification.new do |spec|
     "Gemfile",
     "rbcdx.gemspec",
     "bin/*",
+    "doc/**/*.md",
     "lib/**/*.rb"
   ]
   spec.bindir = "bin"
@@ -30,4 +31,5 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "csv", "~> 3.0"
+  spec.add_dependency "zstd-ruby", "~> 1.5"
 end

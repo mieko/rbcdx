@@ -3,6 +3,7 @@ PATH
   specs:
     rbcdx (0.1.0)
       csv (~> 3.0)
+      zstd-ruby (~> 1.5)
 
 GEM
   remote: https://rubygems.org/
@@ -56,6 +57,7 @@ GEM
     unicode-display_width (3.2.0)
       unicode-emoji (~> 4.1)
     unicode-emoji (4.2.0)
+    zstd-ruby (1.5.7.1)
 
 PLATFORMS
   arm64-darwin-25
@@ -91,6 +93,7 @@ CHECKSUMS
   standard-performance (1.9.0) sha256=49483d31be448292951d80e5e67cdcb576c2502103c7b40aec6f1b6e9c88e3f2
   unicode-display_width (3.2.0) sha256=0cdd96b5681a5949cdbc2c55e7b420facae74c4aaf9a9815eee1087cb1853c42
   unicode-emoji (4.2.0) sha256=519e69150f75652e40bf736106cfbc8f0f73aa3fb6a65afe62fefa7f80b0f80f
+  zstd-ruby (1.5.7.1) sha256=ded1fbf83afa32d613f28448a6d546129c578e5a9df3bd92f3f1e2542169fd21
 
 BUNDLED WITH
   4.0.3

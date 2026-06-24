@@ -31,7 +31,7 @@ module CDX
       when Regexp
         new(field, "~", expected)
       when Array
-        proc { |capture| expected.map(&:to_s).include?(capture[field].to_s) }
+        proc { |capture| expected.map(&:to_s).include?(capture.field(field).to_s) }
       else
         new(field, "=", expected.to_s)
       end
@@ -46,7 +46,7 @@ module CDX
     end
 
     def call(capture)
-      value = capture[field].to_s
+      value = capture.field(field).to_s
 
       case modifier
       when ""

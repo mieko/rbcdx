@@ -25,6 +25,7 @@ module CDX
         by_filename[File.basename(path)] = path
       end
       @entries = nil
+      @entries_by_filename = nil
     end
 
     def paths
@@ -69,30 +70,50 @@ module CDX
     private
 
     def entries
-      @entries ||= File.readlines(cluster_path, chomp: true).filter_map do |line|
-        parse_entry(line)
-      end
+      load_entries
+      @entries
     end
 
-    def referenced_filenames
-      entries.map(&:filename).uniq
+    def entries_by_filename
+      load_entries
+      @entries_by_filename
+    end
+
+    def load_entries
+      return if @entries
+
+      by_filename = {}
+      @entries = File.readlines(cluster_path, chomp: true).filter_map do |line|
+        entry = parse_entry(line)
+        (by_filename[entry.filename] ||= []) << entry if entry
+        entry
+      end
+      @entries_by_filename = by_filename
     end
 
     def covered_filenames
-      @covered_filenames ||= referenced_filenames.select { |filename| fully_covered?(filename) }
+      @covered_filenames ||= entries_by_filename.filter_map do |filename, filename_entries|
+        filename if fully_covered?(filename, filename_entries)
+      end
     end
 
     def covered_filename?(filename)
-      covered_filenames.include?(filename)
+      covered_filename_lookup.key?(filename)
+    end
+
+    def covered_filename_lookup
+      @covered_filename_lookup ||= covered_filenames.each_with_object({}) do |filename, lookup|
+        lookup[filename] = true
+      end
     end
 
     def parse_entry(line)
-      key, filename, offset, length, part = line.split("\t", 5)
+      key, filename, offset, length, part = line.chomp.split("\t", 5)
       return unless key && filename && offset && length
+      return unless offset.match?(/\A\d+\z/) && length.match?(/\A\d+\z/)
+      return if part && !part.match?(/\A\d+\z/)
 
-      Entry.new(key, filename, Integer(offset), Integer(length), part&.to_i)
-    rescue ArgumentError
-      nil
+      Entry.new(key, filename, offset.to_i, length.to_i, part&.to_i)
     end
 
     def candidate_entries(start_key, end_key)
@@ -124,13 +145,13 @@ module CDX
       (entry.part - 1) * BLOCK_LINE_COUNT
     end
 
-    def fully_covered?(filename)
+    def fully_covered?(filename, filename_entries = entries_by_filename.fetch(filename, []))
       path = shard_paths[filename]
       return false unless path && File.file?(path)
 
       target_size = File.size(path)
       position = 0
-      ranges = entries.select { |entry| entry.filename == filename }.map do |entry|
+      ranges = filename_entries.map do |entry|
         [entry.offset, entry.offset + entry.length]
       end.sort
 

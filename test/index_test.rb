@@ -69,6 +69,57 @@ class IndexTest < Minitest::Test
     assert_equal ["https://www.commoncrawl.org/get-started", "https://www.commoncrawl.org/blog/"], captures.map(&:url)
   end
 
+  def test_closest_with_limit_selects_global_candidates_after_scanning_all_matches
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "bounded.cdxj")
+      File.write(path, bounded_cdxj)
+      index = CDX::Index.open(path)
+      seen = []
+      filter = lambda do |capture|
+        seen << capture.url
+        capture.status == "200"
+      end
+
+      captures = index.captures(
+        "bounded.example/*",
+        closest: "20240115000000",
+        limit: 3,
+        filters: filter
+      ).to_a
+
+      assert_equal [
+        "https://bounded.example/day-15",
+        "https://bounded.example/day-14",
+        "https://bounded.example/day-16"
+      ], captures.map(&:url)
+      assert_equal (1..20).map { |day| "https://bounded.example/day-%02d" % day }, seen
+    end
+  end
+
+  def test_sort_with_limit_selects_global_timestamp_candidates
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "timestamp-sort.cdxj")
+      File.write(path, <<~CDXJ)
+        example,sorted)/a 20240105000000 {"url":"https://sorted.example/a","status":"200"}
+        example,sorted)/b 20240101000000 {"url":"https://sorted.example/b","status":"200"}
+        example,sorted)/c 20240103000000 {"url":"https://sorted.example/c","status":"200"}
+        example,sorted)/d 20240102000000 {"url":"https://sorted.example/d","status":"200"}
+        example,sorted)/e 20240104000000 {"url":"https://sorted.example/e","status":"200"}
+      CDXJ
+      index = CDX::Index.open(path)
+
+      assert_equal [
+        "https://sorted.example/b",
+        "https://sorted.example/d",
+        "https://sorted.example/c"
+      ], index.captures("sorted.example/*", sort: :timestamp, limit: 3).map(&:url)
+      assert_equal [
+        "https://sorted.example/a",
+        "https://sorted.example/e"
+      ], index.captures("sorted.example/*", sort: :reverse_timestamp, limit: 2).map(&:url)
+    end
+  end
+
   def test_cdx11_fixture
     index = CDX::Index.open(fixture_path("sample.cdx"))
     capture = index.captures("commoncrawl.org/old").first
@@ -77,6 +128,30 @@ class IndexTest < Minitest::Test
     assert_equal 654, capture.warc_offset
     assert_equal 321, capture.warc_length
     assert_equal 654..974, capture.byte_range
+  end
+
+  def test_capture_numeric_helpers_treat_zero_padded_values_as_decimal
+    capture = CDX::Capture.new({"offset" => "00843", "length" => "00009"})
+
+    assert_equal 843, capture.warc_offset
+    assert_equal 9, capture.warc_length
+    assert_equal 843..851, capture.byte_range
+  end
+
+  def test_string_limit_is_treated_as_decimal
+    captures = @index.captures(limit: "08").to_a
+
+    assert_equal 7, captures.length
+  end
+
+  def test_limit_zero_yields_no_captures
+    assert_empty @index.captures(limit: 0).to_a
+    assert_empty @index.captures("commoncrawl.org/*", sort: :timestamp, limit: "0").to_a
+  end
+
+  def test_limit_must_be_non_negative_decimal
+    assert_raises(ArgumentError) { @index.captures(limit: "bogus").to_a }
+    assert_raises(ArgumentError) { @index.captures(limit: "-1").to_a }
   end
 
   def test_gzip_input
@@ -128,7 +203,211 @@ class IndexTest < Minitest::Test
       File.write(path, "---\n")
 
       error = assert_raises(ArgumentError) { CDX::Index.open(path) }
-      assert_match(/not a supported CDX\/CDXJ index file/, error.message)
+      assert_match(/not a supported local index file/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_files_are_recognized_but_invalid_magic_raises
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "sample.rbcdx")
+      File.write(path, "future binary format")
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/invalid rbcdx magic/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_file_suffixes_are_recognized
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "sample.rbcdxV1a")
+      File.write(path, "future binary format")
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/invalid rbcdx magic/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_missing_header_length
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "sample.rbcdx")
+      File.binwrite(path, CDX::RbcdxFormat::MAGIC)
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/missing rbcdx header length/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_truncated_header
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "sample.rbcdx")
+      File.binwrite(path, CDX::RbcdxFormat::MAGIC + [10].pack("L<") + "{}")
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/truncated rbcdx header/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_truncated_dictionary
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) do |header|
+        header["dict_offset"] = File.size(path)
+        header["dict_length"] = 1
+      end
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/truncated rbcdx dictionary/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_truncated_directory
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) do |header|
+        header["directory_offset"] = header.fetch("cold_blocks_offset") + header.fetch("cold_blocks_length")
+        header["directory_length"] = 1
+      end
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/truncated rbcdx directory/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_invalid_section_bounds
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) { |header| header["dict_offset"] = -1 }
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/invalid rbcdx dictionary section bounds/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_missing_section_bounds
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) { |header| header.delete("directory_length") }
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/missing rbcdx directory section bounds/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_invalid_hot_block_section_bounds
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) { |header| header["hot_blocks_offset"] = -1 }
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path) }
+      assert_match(/invalid rbcdx hot_blocks section bounds/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_hot_block_outside_declared_section
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) { |header| header["hot_blocks_length"] = 0 }
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path).to_a }
+      assert_match(/hot_blocks block exceeds section bounds/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_rejects_cold_block_outside_declared_section
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      rewrite_rbcdx_header(path) { |header| header["cold_blocks_length"] = 0 }
+      capture = CDX::Index.open(path).first
+
+      error = assert_raises(CDX::Error) { capture.digest }
+      assert_match(/cold_blocks block exceeds section bounds/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_wraps_corrupt_hot_block_payload
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      overwrite_rbcdx_section(path, "hot_blocks")
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(path).to_a }
+      assert_match(/hot_blocks block decompression failed/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_wraps_corrupt_cold_block_payload
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "sample.rbcdx", minimal_repackable_cdxj)
+      overwrite_rbcdx_section(path, "cold_blocks")
+      capture = CDX::Index.open(path).first
+
+      error = assert_raises(CDX::Error) { capture.digest }
+      assert_match(/cold_blocks block decompression failed/, error.message)
+    end
+  end
+
+  def test_rbcdx_index_file_matching_is_case_sensitive
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "sample.RBCDX")
+      File.write(path, "not the lowercase rbcdx format")
+
+      error = assert_raises(ArgumentError) { CDX::Index.open(path) }
+      assert_match(/not a supported local index file/, error.message)
+    end
+  end
+
+  def test_directory_rejects_gzip_and_rbcdx_files_together
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "cdx-00000.gz"), "")
+      File.write(File.join(dir, "sample.rbcdx"), "future binary format")
+
+      error = assert_raises(ArgumentError) { CDX::Index.open(dir) }
+      assert_match(/cannot mix CDX \.gz and \.rbcdx index files/, error.message)
+    end
+  end
+
+  def test_directory_rejects_gzip_and_rbcdx_suffix_files_together
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "cdx-00000.gz"), "")
+      File.write(File.join(dir, "sample.rbcdxbin"), "future binary format")
+
+      error = assert_raises(ArgumentError) { CDX::Index.open(dir) }
+      assert_match(/cannot mix CDX \.gz and \.rbcdx index files/, error.message)
+    end
+  end
+
+  def test_directory_does_not_treat_unrelated_gzip_files_as_cdx_mix
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "README.gz"), "compressed notes")
+      File.write(File.join(dir, "sample.rbcdx"), "future binary format")
+
+      error = assert_raises(CDX::Error) { CDX::Index.open(dir) }
+      assert_match(/invalid rbcdx magic/, error.message)
+    end
+  end
+
+  def test_directory_does_not_treat_rbcdx_substrings_as_index_files
+    Dir.mktmpdir do |dir|
+      gz_path = File.join(dir, "cdx-00000.gz")
+      Zlib::GzipWriter.open(gz_path) do |gzip|
+        gzip.write "com,example)/ 20240101010101 {\"url\":\"http://example.com/\",\"status\":\"200\"}\n"
+      end
+      File.write(File.join(dir, "notes.rbcdx.md"), "not an index")
+
+      index = CDX::Index.open(dir)
+      assert_equal [gz_path], index.paths
+      assert_equal ["http://example.com/"], index.map(&:url)
+    end
+  end
+
+  def test_index_rejects_mixed_backends_from_explicit_paths
+    Dir.mktmpdir do |dir|
+      cdx_path = File.join(dir, "sample.cdxj")
+      rbcdx_path = File.join(dir, "sample.rbcdx")
+      File.write(cdx_path, File.read(fixture_path("sample.cdxj")))
+      File.write(rbcdx_path, "future binary format")
+
+      error = assert_raises(ArgumentError) { CDX::Index.open(cdx_path, rbcdx_path) }
+      assert_match(/cannot mix local index formats/, error.message)
     end
   end
 
@@ -181,6 +460,43 @@ class IndexTest < Minitest::Test
         "https://www.commoncrawl.org/blog/",
         "https://assets.commoncrawl.org/logo.png"
       ], index.captures("*.commoncrawl.org").map(&:url)
+    end
+  end
+
+  def test_zipnum_lookup_groups_discontiguous_entries_by_filename
+    Dir.mktmpdir do |dir|
+      first_block = <<~CDXJ
+        com,alpha)/first 20250101010101 {"url":"https://alpha.com/first","status":"200"}
+      CDXJ
+      middle_block = <<~CDXJ
+        com,middle)/only 20250101010102 {"url":"https://middle.com/only","status":"200"}
+      CDXJ
+      second_block = <<~CDXJ
+        com,zeta)/second 20250101010103 {"url":"https://zeta.com/second","status":"200"}
+      CDXJ
+      first_gzip = gzip(first_block)
+      middle_gzip = gzip(middle_block)
+      second_gzip = gzip(second_block)
+      shard_path = File.join(dir, "cdx-00000.gz")
+      middle_path = File.join(dir, "cdx-00001.gz")
+      cluster_path = File.join(dir, "cluster.idx")
+      File.binwrite(shard_path, first_gzip + second_gzip)
+      File.binwrite(middle_path, middle_gzip)
+      File.write(
+        cluster_path,
+        [
+          "com,alpha)/first 20250101010101\tcdx-00000.gz\t0\t#{first_gzip.bytesize}\t1",
+          "com,middle)/only 20250101010102\tcdx-00001.gz\t0\t#{middle_gzip.bytesize}\t1",
+          "com,zeta)/second 20250101010103\tcdx-00000.gz\t#{first_gzip.bytesize}\t#{second_gzip.bytesize}\t2"
+        ].join("\n")
+      )
+
+      zipnum = CDX::ZipNumIndex.new(cluster_path, [shard_path, middle_path])
+      assert_equal [shard_path, middle_path], zipnum.paths
+
+      capture = CDX::Index.open(dir).captures("zeta.com/*").first
+      assert_equal "https://zeta.com/second", capture.url
+      assert_equal 3001, capture.line_number
     end
   end
 
@@ -252,6 +568,48 @@ class IndexTest < Minitest::Test
     end
   end
 
+  def test_zipnum_entries_treat_zero_padded_numbers_as_decimal
+    Dir.mktmpdir do |dir|
+      cluster_path = File.join(dir, "cluster.idx")
+      File.write(cluster_path, "example,zero)/\tcdx-00000.gz\t00008\t00009\t00001\n")
+
+      assert_predicate CDX::ZipNumIndex.new(cluster_path, []), :usable?
+    end
+  end
+
+  def test_rbcdx_manifest_skips_noncandidate_files
+    Dir.mktmpdir do |dir|
+      alpha = repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        com,alpha)/ 20240101010101 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      zeta = repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        com,zeta)/ 20240101010101 {"url":"https://zeta.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      CDX::RbcdxManifest.write([alpha, zeta], File.join(dir, CDX::RbcdxManifest::FILENAME))
+      File.binwrite(zeta, "x" * File.size(zeta))
+
+      index = CDX::Index.open(dir)
+
+      assert_equal ["https://alpha.com/"], index.captures("alpha.com/*").map(&:url)
+    end
+  end
+
+  def test_rbcdx_manifest_keeps_uncovered_files_in_fallback_scan
+    Dir.mktmpdir do |dir|
+      alpha = repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        com,alpha)/ 20240101010101 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        com,zeta)/ 20240101010101 {"url":"https://zeta.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      CDX::RbcdxManifest.write([alpha], File.join(dir, CDX::RbcdxManifest::FILENAME))
+
+      index = CDX::Index.open(dir)
+
+      assert_equal ["https://zeta.com/"], index.captures("zeta.com/*").map(&:url)
+    end
+  end
+
   def test_open_accepts_block_form
     count = CDX::Index.open(fixture_path("sample.cdxj")) do |index|
       index.captures("example.com/*").count
@@ -266,18 +624,69 @@ class IndexTest < Minitest::Test
     assert_same @index, returned
   end
 
-  def test_capture_slice_accepts_varargs
+  def test_capture_exposes_fields_as_methods
     capture = @index.captures("commoncrawl.org/*").first
-
-    assert_equal({"url" => "https://commoncrawl.org/", "status" => "200"}, capture.slice("url", "status"))
-  end
-
-  def test_capture_fields_returns_copy
-    capture = @index.captures("commoncrawl.org/*").first
-    fields = capture.fields
-    fields["url"] = "changed"
 
     assert_equal "https://commoncrawl.org/", capture.url
+    assert_equal "text/html", capture.mime_detected
+    assert_equal "ROOTDIGEST", capture.digest
+    assert_equal "12695", capture.length
+    assert_equal 12_695, capture.warc_length
+  end
+
+  def test_capture_does_not_expose_hash_access
+    capture = @index.captures("commoncrawl.org/*").first
+
+    refute_respond_to capture, :[]
+    refute_respond_to capture, :fetch
+    refute_respond_to capture, :key?
+    refute_respond_to capture, :each
+    refute_respond_to capture, :slice
+    refute_respond_to capture, :fields
+  end
+
+  def test_capture_to_h_returns_copy
+    capture = @index.captures("commoncrawl.org/*").first
+    data = capture.to_h
+    data["url"] = "changed"
+
+    assert_equal "https://commoncrawl.org/", capture.url
+  end
+
+  def test_capture_to_h_materializes_lazy_method_fields
+    capture = LazyCapture.new({"url" => "https://example.com/"}, fields: %w[url digest])
+
+    assert_equal({"url" => "https://example.com/", "digest" => "LAZYDIGEST"}, capture.to_h)
+    assert_equal 1, capture.digest_calls
+  end
+
+  def test_capture_to_h_preserves_fields_that_collide_with_ruby_methods
+    capture = CDX::Capture.new({"hash" => "stored-hash", "class" => "stored-class"})
+
+    assert_equal({"hash" => "stored-hash", "class" => "stored-class"}, capture.to_h)
+    assert_equal "stored-hash", capture.field("hash")
+    assert_equal "stored-class", capture.field("class")
+  end
+
+  def test_capture_field_prefers_stored_data_over_field_like_methods
+    capture = CDX::Capture.new({
+      "warc_url" => "stored-warc-url",
+      "to_h" => "stored-to-h",
+      "field" => "stored-field"
+    })
+
+    assert_equal "stored-warc-url", capture.field("warc_url")
+    assert_equal "stored-to-h", capture.field("to_h")
+    assert_equal "stored-field", capture.field("field")
+    assert_equal({"warc_url" => "stored-warc-url", "to_h" => "stored-to-h", "field" => "stored-field"}, capture.to_h)
+  end
+
+  def test_capture_field_does_not_call_non_capture_field_methods
+    capture = CDX::Capture.new({})
+
+    assert_nil capture.field("warc_url")
+    assert_nil capture.field("to_h")
+    assert_nil capture.field("field")
   end
 
   def test_capture_with_fields_returns_capture
@@ -285,6 +694,15 @@ class IndexTest < Minitest::Test
 
     assert_instance_of CDX::Capture, capture
     assert_equal({"url" => "https://commoncrawl.org/", "status" => "200"}, capture.to_h)
+  end
+
+  def test_capture_with_fields_materializes_lazy_method_fields
+    capture = LazyCapture.new({"url" => "https://example.com/"}, fields: %w[url digest])
+    projected = capture.with_fields("digest")
+
+    assert_instance_of LazyCapture, projected
+    assert_equal 1, capture.digest_calls
+    assert_equal({"digest" => "LAZYDIGEST"}, projected.to_h)
   end
 
   def test_match_keyword_and_validation
@@ -308,9 +726,84 @@ class IndexTest < Minitest::Test
 
   private
 
+  class LazyCapture < CDX::Capture
+    attr_reader :digest_calls
+
+    def initialize(data = {}, source_path: nil, line_number: nil, fields: %w[url digest])
+      @digest_calls = 0
+      super
+    end
+
+    def digest
+      @digest_calls += 1
+      "LAZYDIGEST"
+    end
+  end
+
   def gzip(text)
     output = StringIO.new
     Zlib::GzipWriter.wrap(output) { |gzip| gzip.write(text) }
     output.string
+  end
+
+  def bounded_cdxj
+    (1..20).map do |day|
+      path = "day-%02d" % day
+      timestamp = "202401%02d000000" % day
+      "example,bounded)/#{path} #{timestamp} {\"url\":\"https://bounded.example/#{path}\",\"status\":\"200\"}\n"
+    end.join
+  end
+
+  def minimal_repackable_cdxj
+    <<~CDXJ
+      com,alpha)/ 20240101010101 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def repack_rbcdx(dir, basename, cdxj)
+    input = File.join(dir, "#{basename}.cdxj")
+    output = File.join(dir, basename)
+    File.write(input, cdxj)
+    CDX::Repacker.repack(input, output, max_records: 1)
+    File.delete(input)
+    output
+  end
+
+  def rewrite_rbcdx_header(path)
+    File.open(path, "r+b") do |file|
+      magic = file.read(CDX::RbcdxFormat::MAGIC.bytesize)
+      raise "invalid test rbcdx magic" unless magic == CDX::RbcdxFormat::MAGIC
+
+      header_length = file.read(4).unpack1("L<")
+      header_offset = file.pos
+      header = JSON.parse(file.read(header_length))
+      yield header
+      replacement = JSON.generate(header)
+      raise "test header grew unexpectedly" unless replacement.bytesize <= header_length
+
+      file.seek(header_offset)
+      file.write(replacement)
+      file.write(" " * (header_length - replacement.bytesize))
+    end
+  end
+
+  def overwrite_rbcdx_section(path, name)
+    header = read_rbcdx_header(path)
+    offset = header.fetch("#{name}_offset")
+    length = header.fetch("#{name}_length")
+    File.open(path, "r+b") do |file|
+      file.seek(offset)
+      file.write("\0".b * length)
+    end
+  end
+
+  def read_rbcdx_header(path)
+    File.open(path, "rb") do |file|
+      magic = file.read(CDX::RbcdxFormat::MAGIC.bytesize)
+      raise "invalid test rbcdx magic" unless magic == CDX::RbcdxFormat::MAGIC
+
+      header_length = file.read(4).unpack1("L<")
+      JSON.parse(file.read(header_length))
+    end
   end
 end

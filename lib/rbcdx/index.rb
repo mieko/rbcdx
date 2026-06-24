@@ -1,11 +1,11 @@
-require "stringio"
-require "zlib"
-
 module CDX
   class Index
     include Enumerable
 
-    INDEX_FILE_PATTERN = /(?:\.(?:cdx|cdxj)(?:\.gz)?|\Acdx-\d+\.gz)\z/i
+    BACKENDS = [
+      Backends::Cdx,
+      Backends::Rbcdx
+    ].freeze
 
     attr_reader :paths
 
@@ -18,10 +18,10 @@ module CDX
 
     def initialize(paths, parser: nil)
       @paths = expand_paths(paths)
-      raise ArgumentError, "no local CDX/CDXJ paths were provided" if @paths.empty?
+      raise ArgumentError, "no local index paths were provided" if @paths.empty?
 
       @parser_factory = parser || -> { Parser.new }
-      @zipnum_indexes = ZipNumIndex.find_all(@paths)
+      @backend = backend_for(@paths).new(@paths, parser_factory: @parser_factory)
     end
 
     def each
@@ -59,13 +59,12 @@ module CDX
     def run_query(yielder, url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:)
       matcher = UrlMatcher.new(url, match: match) if url
       checks = Filter.build(filter_list(filters))
-      limit = Integer(limit) if limit
+      limit = normalize_limit(limit)
       sort = validate_sort(sort)
+      return if limit&.zero?
 
       if closest || sort
-        captures = matching_captures(matcher, checks, from, to)
-        captures = sort_captures(captures, closest: closest, sort: sort)
-        captures = captures.first(limit) if limit
+        captures = sorted_matching_captures(matcher, checks, from, to, closest: closest, sort: sort, limit: limit)
         captures.each { |capture| yielder << project(capture, fields) }
         return
       end
@@ -80,12 +79,14 @@ module CDX
       end
     end
 
-    def matching_captures(matcher, checks, from, to)
-      matches = []
+    def each_matching_capture(matcher, checks, from, to)
+      return enum_for(:each_matching_capture, matcher, checks, from, to) unless block_given?
+
       each_capture(matcher: matcher) do |capture|
-        matches << capture if capture_matches?(capture, matcher, checks, from, to)
+        next unless capture_matches?(capture, matcher, checks, from, to)
+
+        yield capture
       end
-      matches
     end
 
     def filter_list(filters)
@@ -100,24 +101,67 @@ module CDX
     end
 
     def sort_captures(captures, closest:, sort:)
+      key = sort_key_for(closest: closest, sort: sort)
+      return captures.sort_by(&key) if closest
+
+      case sort&.to_sym
+      when :timestamp
+        captures.sort_by(&key)
+      when :reverse_timestamp
+        captures.sort_by(&key).reverse
+      when nil
+        captures
+      else
+        raise ArgumentError, "unsupported sort: #{sort.inspect}"
+      end
+    end
+
+    def sorted_matching_captures(matcher, checks, from, to, closest:, sort:, limit:)
+      captures = each_matching_capture(matcher, checks, from, to)
+      key = sort_key_for(closest: closest, sort: sort)
+      return sort_captures(captures.to_a, closest: closest, sort: sort) unless limit
+      return limited_reverse_sorted_captures(captures, limit, key) if sort&.to_sym == :reverse_timestamp && !closest
+
+      captures.each_with_index
+        .min_by(limit) { |capture, sequence| [key.call(capture), sequence] }
+        .sort_by { |capture, sequence| [key.call(capture), sequence] }
+        .map(&:first)
+    end
+
+    def limited_reverse_sorted_captures(captures, limit, key)
+      captures.each_with_index
+        .max_by(limit) { |capture, sequence| [key.call(capture), sequence] }
+        .sort_by { |capture, sequence| [key.call(capture), sequence] }
+        .reverse
+        .map(&:first)
+    end
+
+    def sort_key_for(closest:, sort:)
       if closest
         target = Timestamp.to_time(closest)
-        return captures.sort_by do |capture|
+        return lambda do |capture|
           timestamp = Timestamp.to_time(capture.timestamp)
           [(timestamp - target).abs, capture.timestamp.to_s]
         end
       end
 
       case sort&.to_sym
-      when :timestamp
-        captures.sort_by { |capture| capture.timestamp.to_s }
-      when :reverse_timestamp
-        captures.sort_by { |capture| capture.timestamp.to_s }.reverse
+      when :timestamp, :reverse_timestamp
+        ->(capture) { capture.timestamp.to_s }
       when nil
-        captures
+        -> {}
       else
         raise ArgumentError, "unsupported sort: #{sort.inspect}"
       end
+    end
+
+    def normalize_limit(limit)
+      return nil if limit.nil?
+
+      string = limit.to_s
+      raise ArgumentError, "limit must be a non-negative integer" unless string.match?(/\A\d+\z/)
+
+      string.to_i
     end
 
     def project(capture, fields)
@@ -141,60 +185,11 @@ module CDX
     end
 
     def each_capture(matcher: nil)
-      if matcher && @zipnum_indexes.any?
-        zipnum_by_path = @zipnum_indexes.each_with_object({}) do |index, indexes|
-          index.paths.each { |path| indexes[path] = index }
-        end
-        paths.each do |path|
-          if (index = zipnum_by_path[path])
-            index.captures_for(matcher, parser_factory: @parser_factory, path: path) { |capture| yield capture }
-          else
-            each_capture_from_paths([path]) { |capture| yield capture }
-          end
-        end
-      else
-        each_capture_from_paths(paths) { |capture| yield capture }
-      end
-    end
-
-    def each_capture_from_paths(paths)
-      paths.each do |path|
-        parser = @parser_factory.call
-        line_number = 0
-        open_path(path) do |io|
-          io.each_line do |line|
-            line_number += 1
-            data = parser.parse(line)
-            next unless data
-
-            yield Capture.new(data, source_path: path, line_number: line_number)
-          end
-        end
-      end
-    end
-
-    def open_path(path)
-      if path.end_with?(".gz")
-        open_gzip_path(path) { |gzip| yield gzip }
-      else
-        File.open(path, "r:utf-8") { |file| yield file }
-      end
-    end
-
-    def open_gzip_path(path)
-      File.open(path, "rb") do |file|
-        unused = nil
-        until file.eof? && unused.to_s.empty?
-          gzip = Zlib::GzipReader.new(PrependedIO.new(unused, file))
-          yield gzip
-          unused = gzip.unused
-          gzip.finish
-        end
-      end
+      @backend.each_capture(matcher: matcher) { |capture| yield capture }
     end
 
     def expand_paths(paths)
-      Array(paths).flatten.compact.flat_map do |path|
+      expanded = Array(paths).flatten.compact.flat_map do |path|
         string = path.to_s
         expanded = Dir.glob(File.expand_path(string))
         if expanded.empty? || !glob_pattern?(string)
@@ -203,6 +198,8 @@ module CDX
           expanded.flat_map { |entry| expand_discovered_entry(entry) }
         end
       end.uniq.sort
+      validate_backend_mix!(expanded)
+      expanded
     end
 
     def glob_pattern?(path)
@@ -216,7 +213,7 @@ module CDX
         validate_index_file!(entry)
         [entry]
       else
-        raise ArgumentError, "CDX/CDXJ path does not exist: #{entry}"
+        raise ArgumentError, "index path does not exist: #{entry}"
       end
     end
 
@@ -231,57 +228,47 @@ module CDX
     end
 
     def expand_directory(entry)
-      Dir.glob(File.join(entry, "**", "*")).select do |path|
-        File.file?(path) && index_file?(path)
+      files = Dir.glob(File.join(entry, "**", "*")).select { |path| File.file?(path) }
+      validate_local_directory_mix!(files)
+      files.select do |path|
+        index_file?(path)
       end
     end
 
     def validate_index_file!(path)
       return if index_file?(path)
 
-      raise ArgumentError, "not a supported CDX/CDXJ index file: #{path}"
+      raise ArgumentError, "not a supported local index file: #{path}"
     end
 
     def index_file?(path)
-      File.basename(path).match?(INDEX_FILE_PATTERN)
+      BACKENDS.any? { |backend| backend.index_file?(path) }
     end
 
-    class PrependedIO
-      def initialize(prefix, io)
-        @prefix = StringIO.new(prefix.to_s)
-        @io = io
+    def backend_for(paths)
+      matching_backends = BACKENDS.select do |backend|
+        paths.any? { |path| backend.index_file?(path) }
       end
 
-      def read(length = nil, outbuf = nil)
-        data = length ? read_length(length) : @prefix.read.to_s + @io.read.to_s
-        outbuf.replace(data) if outbuf && data
-        data
-      end
+      return matching_backends.first if matching_backends.length == 1
 
-      def readpartial(length, outbuf = nil)
-        data = read(length)
-        raise EOFError unless data
+      names = matching_backends.map { |backend| backend.name.split("::").last }.join(", ")
+      raise ArgumentError, "cannot mix local index formats in one CDX::Index: #{names}"
+    end
 
-        outbuf&.replace(data)
-        data
-      end
+    def validate_backend_mix!(paths)
+      return if paths.empty?
 
-      def eof?
-        @prefix.eof? && @io.eof?
-      end
+      backend_for(paths)
+    end
 
-      private
+    def validate_local_directory_mix!(files)
+      files.group_by { |path| File.dirname(path) }.each do |dir, dir_files|
+        has_cdx_gzip = dir_files.any? { |path| Backends::Cdx.index_file?(path) && File.basename(path).end_with?(".gz") }
+        has_rbcdx = dir_files.any? { |path| Backends::Rbcdx.index_file?(path) }
+        next unless has_cdx_gzip && has_rbcdx
 
-      def read_length(length)
-        data = +""
-        while data.bytesize < length
-          source = @prefix.eof? ? @io : @prefix
-          chunk = source.read(length - data.bytesize)
-          break unless chunk
-
-          data << chunk
-        end
-        data.empty? ? nil : data
+        raise ArgumentError, "cannot mix CDX .gz and .rbcdx index files in the same directory: #{dir}"
       end
     end
   end
