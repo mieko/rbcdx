@@ -100,7 +100,7 @@ module CDX
 
       def initialize(name:, polarity: true)
         @name = name.to_s
-        @polarity = polarity == false ? false : true
+        @polarity = polarity != false
         freeze
       end
 

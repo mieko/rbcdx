@@ -128,6 +128,8 @@ module CDX
           zstd_level: options.fetch(:zstd_level, 6),
           filters: options.fetch(:filters),
           where: options.fetch(:where),
+          collapse: options[:collapse],
+          collapse_order: options[:collapse_order],
           force: options.fetch(:force, false)
         )
         entry = RepackPlanEntry.new(File.expand_path(input), File.expand_path(options.fetch(:output)))
@@ -150,6 +152,8 @@ module CDX
         zstd_level: options.fetch(:zstd_level, 6),
         filters: options.fetch(:filters),
         where: options.fetch(:where),
+        collapse: options[:collapse],
+        collapse_order: options[:collapse_order],
         force: options.fetch(:force, false),
         progress: ->(event, **payload) { progress.call(event, entry: entry, index: 1, total: 1, **payload) }
       )
@@ -180,6 +184,8 @@ module CDX
           zstd_level: options.fetch(:zstd_level, 6),
           filters: options.fetch(:filters),
           where: options.fetch(:where),
+          collapse: options[:collapse],
+          collapse_order: options[:collapse_order],
           resume: options.fetch(:resume, false),
           force: options.fetch(:force, false),
           dry_run: options.fetch(:dry_run, false),
@@ -308,6 +314,12 @@ module CDX
         opts.on("--sort SORT", "timestamp or reverse_timestamp") do |sort|
           options[:sort] = sort.to_sym
         end
+        opts.on("--collapse FIELD", "Collapse captures: urlkey") do |collapse|
+          options[:collapse] = collapse.to_sym
+        end
+        opts.on("--collapse-order ORDER", "Collapse order: latest") do |collapse_order|
+          options[:collapse_order] = collapse_order.to_sym
+        end
       end
 
       parser.order!(@argv)
@@ -414,6 +426,12 @@ module CDX
         opts.on("--where FILTER", "CDX field filter, for example '=status:200'") do |filter|
           options[:where] << filter
         end
+        opts.on("--collapse FIELD", "Collapse captures before writing: urlkey") do |collapse|
+          options[:collapse] = collapse.to_sym
+        end
+        opts.on("--collapse-order ORDER", "Collapse order: latest") do |collapse_order|
+          options[:collapse_order] = collapse_order.to_sym
+        end
         opts.on("--resume", "Resume a batch repack") do
           options[:resume] = true
         end
@@ -508,7 +526,9 @@ module CDX
         closest: options[:closest],
         filters: options[:filters],
         match: options[:match],
-        sort: options[:sort]
+        sort: options[:sort],
+        collapse: options[:collapse],
+        collapse_order: options[:collapse_order]
       }.compact
     end
 
@@ -607,6 +627,14 @@ module CDX
       unless manifest == true || manifest == false
         raise Error, "#{repack_log_path}: invalid repack log manifest"
       end
+      collapse = log_options.fetch("collapse", nil)
+      unless collapse.nil? || collapse.is_a?(String)
+        raise Error, "#{repack_log_path}: invalid repack log collapse"
+      end
+      collapse_order = log_options.fetch("collapse_order", nil)
+      unless collapse_order.nil? || collapse_order.is_a?(String)
+        raise Error, "#{repack_log_path}: invalid repack log collapse_order"
+      end
 
       @argv.replace(inputs)
       options[:output_dir] = output_dir
@@ -619,6 +647,8 @@ module CDX
       options[:where] = where
       options[:delete_when_processed] = delete_when_processed
       options[:manifest] = manifest
+      options[:collapse] = collapse&.to_sym
+      options[:collapse_order] = collapse_order&.to_sym
     end
 
     def prepare_repack_log(options, inputs)
@@ -687,7 +717,9 @@ module CDX
         "filters" => CaptureFilters.stable_terms(options.fetch(:filters), label: "repack filter"),
         "where" => options.fetch(:where),
         "delete_when_processed" => options.fetch(:delete_when_processed, false),
-        "manifest" => options.fetch(:manifest, true)
+        "manifest" => options.fetch(:manifest, true),
+        "collapse" => options[:collapse]&.to_s,
+        "collapse_order" => options[:collapse_order]&.to_s
       }.compact
     end
 
@@ -737,6 +769,8 @@ module CDX
           --zstd-level N          Zstandard compression level (rbcdx)
           --filter EXPR           Filter expression, for example '+status_200,-asset_like'
           --where FILTER          CDX field filter, for example '=status:200'
+          --collapse FIELD        Collapse captures before writing: urlkey
+          --collapse-order ORDER  Collapse order: latest
           --resume                Resume a batch repack
           --force                 Overwrite outputs and batch state
           --dry-run               Preview outputs and filter counts without writing files
@@ -836,7 +870,7 @@ module CDX
         when :delete_planned
           @io.puts "would delete after written output [#{index}/#{total}] #{entry.input_path}"
         when :preview
-          @io.puts "filtered [#{index}/#{total}] #{entry.input_path}: #{preview.record_count} of #{preview.total_records} records passed filters"
+          @io.puts "filtered [#{index}/#{total}] #{entry.input_path}: #{preview.record_count} of #{preview.total_records} records selected"
         when :start
           @io.puts "processing [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         when :progress

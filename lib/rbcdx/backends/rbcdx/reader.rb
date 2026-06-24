@@ -82,6 +82,14 @@ module CDX
           tables.fetch(name).fetch(id - 1)
         end
 
+        def key_range
+          first = blocks.first
+          last = blocks.last
+          return unless first && last
+
+          [first.first_urlkey, last.last_urlkey]
+        end
+
         def reconstruct_filename(kind, segment_id, warc_time_pair_id, shard_id, fallback_filename_id)
           if kind == 3
             return table_value("fallback-filename", fallback_filename_id)

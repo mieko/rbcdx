@@ -56,7 +56,7 @@ module CDX
           true
         end
 
-        def prepare(reader, filters, progress: nil)
+        def prepare(reader, filters, selection: nil, progress: nil)
           tables = Format::TABLE_NAMES.to_h { |name| [name, Set.new] }
           crawl_id_state = {}
           total_records = 0
@@ -68,7 +68,7 @@ module CDX
           reader.each_capture do |capture, raw_line, source_offset|
             total_records += 1
             raw_bytes += Repack.line_bytes(capture, raw_line)
-            if Repack.keep?(filters, capture)
+            if Repack.keep?(filters, capture) && Repack.selected?(selection, capture)
               urlkey, _timestamp, object = capture_parts(capture)
               Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
               Format.validate_cdxj_object(capture.source_path, capture.line_number, urlkey, object)
@@ -88,10 +88,10 @@ module CDX
           }
         end
 
-        def preview(reader, filters, progress: nil)
+        def preview(reader, filters, selection: nil, progress: nil)
           maps = Format::TABLE_NAMES.to_h { |name| [name, PreviewDictionaryMap.new] }
           crawl_id_state = {}
-          summarize(reader, filters, validate: ->(capture, _raw_line) {
+          summarize(reader, filters, selection: selection, validate: ->(capture, _raw_line) {
             build_record(capture, maps, crawl_id_state)
           }, progress: progress)
         end
@@ -121,7 +121,7 @@ module CDX
           flush_block if @block_source_bytes >= @block_bytes || @block_records.length >= @max_records
         end
 
-        def finish(summary:, source_signature:, filter_signature:, options_metadata:, **_options)
+        def finish(summary:, source_signature:, filter_signature:, options_metadata:, collapse_signature: nil, **_options)
           flush_block
           unless summary.selected_fingerprint == @prepared.fetch(:selected_fingerprint)
             raise Error, "repack filters selected different records between passes"
@@ -131,6 +131,15 @@ module CDX
           end
 
           directory_data = Format.encode_directory(@blocks, @restart_interval)
+          repack = {
+            "source" => source_signature,
+            "options" => options_metadata,
+            "filter_signature" => filter_signature,
+            "selected_fingerprint" => summary.selected_fingerprint,
+            "extra" => @metadata
+          }
+          repack["collapse_signature"] = collapse_signature if collapse_signature
+
           header = {
             "magic" => Format::MAGIC,
             "version" => Format::VERSION,
@@ -147,13 +156,7 @@ module CDX
             "offset_sum" => @offset_sum,
             "hot_column_names" => Format::HOT_COLUMN_NAMES,
             "cold_column_names" => Format::COLD_COLUMN_NAMES,
-            "repack" => {
-              "source" => source_signature,
-              "options" => options_metadata,
-              "filter_signature" => filter_signature,
-              "selected_fingerprint" => summary.selected_fingerprint,
-              "extra" => @metadata
-            }
+            "repack" => repack
           }
 
           write_output(

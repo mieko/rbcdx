@@ -7,6 +7,7 @@ module CDX
     FORMAT = "rbcdx-repack-state"
     VERSION = 1
     STATE_FILENAME = "rbcdx-repack-state.json"
+    SELECTION_DIRNAME = "rbcdx-collapse-selection"
 
     Result = Struct.new(:input_path, :output_path, :status, :result, :message)
     Entry = Struct.new(
@@ -18,7 +19,8 @@ module CDX
       :output_format,
       :output_signature,
       :record_count,
-      :selected_fingerprint
+      :selected_fingerprint,
+      :selection_path
     ) do
       def self.from_h(data)
         input_path = data.fetch("input_path")
@@ -43,7 +45,8 @@ module CDX
           output_format: output_format,
           output_signature: data["output_signature"],
           record_count: data["record_count"],
-          selected_fingerprint: data["selected_fingerprint"]
+          selected_fingerprint: data["selected_fingerprint"],
+          selection_path: data["selection_path"]
         )
       end
 
@@ -57,7 +60,8 @@ module CDX
           "output_format" => output_format,
           "output_signature" => output_signature,
           "record_count" => record_count,
-          "selected_fingerprint" => selected_fingerprint
+          "selected_fingerprint" => selected_fingerprint,
+          "selection_path" => selection_path
         }.compact
       end
 
@@ -85,7 +89,7 @@ module CDX
     def initialize(inputs, output_dir:, output_format: "rbcdx", block_bytes: Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES,
       max_records: Backends::RbCDX::Format::DEFAULT_MAX_RECORDS, restart_interval: Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL,
       zstd_level: 6, filters: nil, where: nil, filter_signature: nil, resume: false, force: false,
-      dry_run: false, delete_when_processed: false, manifest: true, progress: nil)
+      dry_run: false, delete_when_processed: false, manifest: true, collapse: nil, collapse_order: nil, progress: nil)
       @input_specs = Array(inputs).flatten.compact.map(&:to_s)
       @output_dir = File.expand_path(output_dir)
       @output_format = output_format.to_s
@@ -97,7 +101,11 @@ module CDX
       @zstd_level = rbcdx? ? decimal_option("zstd_level", zstd_level) : zstd_level
       @filters = filters
       @where = where
+      @compiled_filters = RepackFilters.build(filters, where: where)
       @filter_signature = filter_signature || inferred_filter_signature(resume: resume, delete_when_processed: delete_when_processed)
+      @collapse_config = CaptureCollapse.build(collapse: collapse, collapse_order: collapse_order)
+      @collapse_signature = @collapse_config&.signature
+      @selection_by_input = {}
       @resume = resume
       @force = force
       @dry_run = dry_run
@@ -115,6 +123,7 @@ module CDX
       discovered_entries = discover_entries(state: state)
       entries = entries_for_run(discovered_entries, state)
       raise ArgumentError, "no CDX/CDXJ input files were found" if entries.empty?
+      prepare_collapse_selection(entries, persist: !@dry_run, state: state)
 
       return dry_run(entries) if @dry_run
 
@@ -301,7 +310,108 @@ module CDX
 
         raise Error, "input changed since checkpoint: #{entry.input_path}"
       end
+      validate_state_selection!(state_entries)
       state_entries
+    end
+
+    def validate_state_selection!(entries)
+      return unless @collapse_config
+
+      entries.each do |entry|
+        unless entry.selection_path.is_a?(String) && !entry.selection_path.empty?
+          raise Error, "repack state does not include collapse selection for #{entry.input_path}"
+        end
+      end
+    end
+
+    def prepare_collapse_selection(entries, persist:, state:)
+      return unless @collapse_config
+
+      if state && @resume
+        entries.each do |entry|
+          next unless entry.selection_path && File.file?(entry.selection_path)
+
+          @selection_by_input[entry.input_path] = RepackSelection::LineSelection.read(entry.selection_path)
+        end
+        return
+      end
+
+      selected = select_global_line_numbers(entries)
+      entries.each_with_index do |entry, index|
+        line_numbers = selected.fetch(entry.input_path)
+        @selection_by_input[entry.input_path] = RepackSelection::LineSelection.new(line_numbers)
+        next unless persist
+
+        entry.selection_path = selection_path_for(entry, index)
+        RepackSelection::LineSelection.write(entry.selection_path, line_numbers)
+      end
+    end
+
+    def select_global_line_numbers(entries)
+      selected = entries.to_h { |entry| [entry.input_path, []] }
+      current_urlkey = nil
+      current_entry = nil
+      current_entry_index = nil
+      current_capture = nil
+
+      entries.each_with_index do |entry, entry_index|
+        Backends::CDXJ::RepackReader.new(entry.input_path).each_capture do |capture, _raw_line, _source_offset|
+          next unless Repack.keep?(@compiled_filters, capture)
+
+          urlkey = capture.urlkey.to_s
+          if current_urlkey && urlkey < current_urlkey
+            raise UnsupportedCollapse, "collapse: :urlkey requires globally urlkey-grouped input files"
+          end
+
+          if current_urlkey && urlkey != current_urlkey
+            selected.fetch(current_entry.input_path) << current_capture.line_number
+            current_urlkey = urlkey
+            current_entry = entry
+            current_entry_index = entry_index
+            current_capture = capture
+          else
+            current_urlkey ||= urlkey
+            current_entry ||= entry
+            current_entry_index ||= entry_index
+            if better_batch_capture?(entry_index, capture, current_entry_index, current_capture)
+              current_entry = entry
+              current_entry_index = entry_index
+              current_capture = capture
+            end
+          end
+        end
+      end
+
+      selected.fetch(current_entry.input_path) << current_capture.line_number if current_capture
+      selected
+    end
+
+    def better_batch_capture?(entry_index, capture, best_entry_index, best_capture)
+      return true unless best_capture
+      return true if capture.timestamp.to_s > best_capture.timestamp.to_s
+      return false if capture.timestamp.to_s < best_capture.timestamp.to_s
+
+      return entry_index > best_entry_index unless entry_index == best_entry_index
+
+      capture.line_number.to_i > best_capture.line_number.to_i
+    end
+
+    def selected_line_numbers_for(entry)
+      return unless @collapse_config
+
+      selection = @selection_by_input[entry.input_path]
+      if selection.nil? && entry.selection_path && File.file?(entry.selection_path)
+        selection = RepackSelection::LineSelection.read(entry.selection_path)
+        @selection_by_input[entry.input_path] = selection
+      end
+      raise Error, "collapse selection is missing for #{entry.input_path}" unless selection
+
+      selection.line_numbers
+    end
+
+    def selection_path_for(entry, index)
+      basename = "#{format("%05d", index)}-#{File.basename(entry.output_path)}.lines"
+      File.join(@output_dir, SELECTION_DIRNAME, basename)
     end
 
     def process_entry(entry, index, total)
@@ -332,6 +442,8 @@ module CDX
 
       emit_progress(:start, entry: entry, index: index, total: total)
       update_entry_state(entry, "processing")
+      expected_fingerprint = expected_selected_fingerprint(entry)
+      validate_selection_sidecar!(entry, expected_fingerprint)
       result = Repacker.repack(
         input_path,
         output_path,
@@ -343,12 +455,21 @@ module CDX
         filters: @filters,
         where: @where,
         filter_signature: @filter_signature,
+        collapse: collapse_field,
+        collapse_order: collapse_order,
+        selected_line_numbers: selected_line_numbers_for(entry),
         atomic: true,
         verify: true,
         force: @force,
         metadata: {"batch_plan" => plan_signature},
         progress: entry_progress(entry, index, total)
       )
+      unless result.source_signature == entry.source_signature
+        raise Error, "source changed before output was written: #{input_path}"
+      end
+      unless result.selected_fingerprint == expected_fingerprint
+        raise Error, "new output selected records do not match this repack plan: #{output_path}"
+      end
       record_result(entry, result)
       raise Error, "new output does not match this repack plan: #{output_path}" unless matching_output?(entry)
 
@@ -383,14 +504,56 @@ module CDX
 
       header = Repacker.read_header(output_path)
       repack = header.fetch("repack")
-      repack.fetch("source") == entry.source_signature &&
+      selected_fingerprint = repack.fetch("selected_fingerprint")
+      expected_fingerprint = expected_selected_fingerprint(entry)
+      matches = repack.fetch("source") == entry.source_signature &&
         repack.fetch("options") == repack_options_metadata &&
         repack.fetch("filter_signature") == @filter_signature &&
-        repack.fetch("selected_fingerprint").is_a?(Hash) &&
-        header.fetch("record_count") == repack.fetch("selected_fingerprint").fetch("count") &&
+        repack.fetch("collapse_signature", nil) == @collapse_signature &&
+        selected_fingerprint.is_a?(Hash) &&
+        selected_fingerprint == expected_fingerprint &&
+        header.fetch("record_count") == selected_fingerprint.fetch("count") &&
         (!verify || Repacker.verify_output(output_path, header.fetch("record_count")))
+      recover_entry_from_rbcdx_output(entry, header, selected_fingerprint) if matches
+      matches
     rescue
       false
+    end
+
+    def validate_selection_sidecar!(entry, expected_fingerprint)
+      return unless @collapse_config
+      return unless expected_fingerprint.is_a?(Hash)
+      return unless entry.selected_fingerprint.is_a?(Hash)
+
+      selection = RepackSelection::LineSelection.new(selected_line_numbers_for(entry))
+      actual_fingerprint = fingerprint_selected_input(entry.input_path, selection)
+      return if actual_fingerprint == expected_fingerprint
+
+      raise Error, "collapse selection sidecar does not match this repack plan: #{entry.input_path}"
+    end
+
+    def expected_selected_fingerprint(entry)
+      return entry.selected_fingerprint if entry.selected_fingerprint.is_a?(Hash)
+      return unless File.file?(entry.input_path)
+
+      selection = RepackSelection::LineSelection.new(selected_line_numbers_for(entry)) if @collapse_config
+      fingerprint_selected_input(entry.input_path, selection)
+    end
+
+    def fingerprint_selected_input(input_path, selection)
+      fingerprint = Repack.new_selected_fingerprint
+      Backends::CDXJ::RepackReader.new(input_path).each_capture do |capture, raw_line, _source_offset|
+        next unless Repack.keep?(@compiled_filters, capture) && Repack.selected?(selection, capture)
+
+        Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
+      end
+      Repack.finish_selected_fingerprint(fingerprint)
+    end
+
+    def recover_entry_from_rbcdx_output(entry, header, selected_fingerprint)
+      entry.output_signature ||= Repack.file_signature(entry.output_path)
+      entry.record_count ||= header.fetch("record_count")
+      entry.selected_fingerprint ||= selected_fingerprint
     end
 
     def matching_cdxj_output?(entry)
@@ -426,6 +589,9 @@ module CDX
           filters: @filters,
           where: @where,
           filter_signature: @filter_signature,
+          collapse: collapse_field,
+          collapse_order: collapse_order,
+          selected_line_numbers: selected_line_numbers_for(entry),
           force: @force,
           metadata: {"batch_plan" => plan_signature}
         )
@@ -555,7 +721,7 @@ module CDX
     end
 
     def plan_signature
-      {
+      signature = {
         "input_specs" => @input_specs.map { |input| File.expand_path(input) },
         "output_dir" => @output_dir,
         "output_format" => @output_format,
@@ -563,6 +729,8 @@ module CDX
         "filter_signature" => @filter_signature,
         "manifest" => @manifest
       }
+      signature["collapse_signature"] = @collapse_signature if @collapse_signature
+      signature
     end
 
     def repack_options_metadata
@@ -584,6 +752,14 @@ module CDX
       lambda do |event, **payload|
         emit_progress(event, entry: entry, index: index, total: total, **payload)
       end
+    end
+
+    def collapse_field
+      @collapse_config&.field&.to_sym
+    end
+
+    def collapse_order
+      @collapse_config&.order&.to_sym
     end
 
     def rbcdx?

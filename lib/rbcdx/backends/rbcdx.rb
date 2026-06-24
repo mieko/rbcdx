@@ -95,7 +95,65 @@ module CDX
         end
       end
 
+      def validate_urlkey_collapse!(matcher)
+        previous_last = nil
+        collapse_candidate_paths(matcher).each do |path|
+          range = reader_for(path).key_range
+          next unless range
+
+          first, last = range
+          if previous_last && first < previous_last
+            raise UnsupportedCollapse, "collapse: :urlkey requires globally urlkey-grouped .rbcdx files"
+          end
+          previous_last = last
+        end
+        true
+      end
+
       private
+
+      def collapse_candidate_paths(matcher)
+        return paths unless matcher
+
+        manifest_by_path = manifests_by_path
+        specs = query_specs(matcher)
+        candidates = @manifests.any? ? manifest_candidate_paths(specs) : {}
+        paths.select do |path|
+          if manifest_by_path.key?(path)
+            candidates.include?(path)
+          else
+            range_overlaps_specs?(reader_for(path).key_range, specs)
+          end
+        end
+      end
+
+      def range_overlaps_specs?(range, specs)
+        return false unless range
+
+        specs.any? do |urlkey, prefix|
+          range_overlaps_query?(range, urlkey.to_s, prefix: prefix)
+        end
+      end
+
+      def range_overlaps_query?(range, query, prefix:)
+        first, last = range
+        if prefix
+          end_key = prefix_successor(query)
+          last >= query && (end_key.nil? || first < end_key)
+        else
+          query.between?(first, last)
+        end
+      end
+
+      def prefix_successor(prefix)
+        bytes = prefix.b.bytes
+        index = bytes.length - 1
+        index -= 1 while index >= 0 && bytes[index] == 255
+        return if index.negative?
+
+        bytes[index] += 1
+        bytes[0..index].pack("C*")
+      end
 
       def normalize_cursor_position(position, spec_count)
         return {"path_index" => 0, "spec_index" => 0, "block_index" => 0, "record_index" => 0} unless position

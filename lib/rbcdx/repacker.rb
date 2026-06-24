@@ -29,12 +29,12 @@ module CDX
         false
       end
 
-      def prepare(_reader, _filters)
+      def prepare(_reader, _filters, selection: nil)
         nil
       end
 
-      def preview(reader, filters, progress: nil)
-        summarize(reader, filters, progress: progress)
+      def preview(reader, filters, selection: nil, progress: nil)
+        summarize(reader, filters, selection: selection, progress: progress)
       end
 
       def cleanup
@@ -42,7 +42,7 @@ module CDX
 
       private
 
-      def summarize(reader, filters, validate: nil, progress: nil)
+      def summarize(reader, filters, selection: nil, validate: nil, progress: nil)
         total_records = 0
         record_count = 0
         raw_bytes = 0
@@ -52,7 +52,7 @@ module CDX
         reader.each_capture do |capture, raw_line, source_offset|
           total_records += 1
           raw_bytes += Repack.line_bytes(capture, raw_line)
-          if Repack.keep?(filters, capture)
+          if Repack.keep?(filters, capture) && Repack.selected?(selection, capture)
             validate&.call(capture, raw_line)
             Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
             record_count += 1
@@ -96,6 +96,10 @@ module CDX
 
     def keep?(filters, capture)
       filters.empty? || RepackFilters.keep?(filters, capture)
+    end
+
+    def selected?(selection, capture)
+      selection.nil? || selection.include?(capture.line_number)
     end
 
     def line_bytes(capture, raw_line)
@@ -269,6 +273,7 @@ module CDX
       block_bytes: Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES, max_records: Backends::RbCDX::Format::DEFAULT_MAX_RECORDS,
       restart_interval: Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL, zstd_level: 6,
       filters: nil, where: nil, filter_signature: nil, filter_registry: RepackFilters::DEFAULT_REGISTRY,
+      collapse: nil, collapse_order: nil, selected_line_numbers: nil,
       atomic: true, verify: true, force: false, metadata: nil, progress: nil)
       @input_path = File.expand_path(input_path)
       @output_path = File.expand_path(output_path)
@@ -278,6 +283,9 @@ module CDX
       end
       @filter_signature = filter_signature || inferred_filter_signature(filters, where, filter_registry)
       @filters = RepackFilters.build(filters, registry: filter_registry, where: where)
+      @collapse_config = CaptureCollapse.build(collapse: collapse, collapse_order: collapse_order)
+      @collapse_signature = @collapse_config&.signature
+      @selected_line_numbers = selected_line_numbers
       @force = force
       @progress = progress
       @writer_options = {
@@ -301,16 +309,19 @@ module CDX
       writer = @writer_class.new(@output_path, **@writer_options)
       source_signature = current_source_signature
       total_bytes = source_signature.fetch("bytes")
-      prepared = writer.prepare(reader, @filters, progress: progress_reporter("prepare", total_bytes)) if writer.needs_prepare?
+      selection = line_selection(reader, total_bytes)
+      ensure_source_unchanged!(source_signature) if @collapse_config
+      prepared = writer.prepare(reader, @filters, selection: selection, progress: progress_reporter("prepare", total_bytes)) if writer.needs_prepare?
       ensure_source_unchanged!(source_signature) if writer.needs_prepare?
 
       writer.start(prepared)
-      summary = stream_to_writer(reader, writer, progress: progress_reporter("write", total_bytes))
+      summary = stream_to_writer(reader, writer, selection: selection, progress: progress_reporter("write", total_bytes))
       ensure_source_unchanged!(source_signature)
       writer.finish(
         summary: summary,
         source_signature: source_signature,
         filter_signature: @filter_signature,
+        collapse_signature: @collapse_signature,
         options_metadata: repack_options_metadata(writer)
       )
     rescue
@@ -328,7 +339,10 @@ module CDX
       reader = Backends::CDXJ::RepackReader.new(@input_path)
       writer = @writer_class.new(@output_path, **@writer_options)
       source_signature = current_source_signature
-      summary = writer.preview(reader, @filters, progress: progress_reporter("preview", source_signature.fetch("bytes")))
+      total_bytes = source_signature.fetch("bytes")
+      selection = line_selection(reader, total_bytes)
+      ensure_source_unchanged!(source_signature) if @collapse_config
+      summary = writer.preview(reader, @filters, selection: selection, progress: progress_reporter("preview", total_bytes))
       ensure_source_unchanged!(source_signature)
       Preview.new(
         @output_path,
@@ -350,7 +364,21 @@ module CDX
       nil
     end
 
-    def stream_to_writer(reader, writer, progress: nil)
+    def line_selection(reader, total_bytes)
+      return RepackSelection::LineSelection.new(@selected_line_numbers) if @selected_line_numbers
+      return unless @collapse_config
+
+      RepackSelection::LineSelection.new(
+        RepackSelection.select_line_numbers(
+          reader,
+          @filters,
+          @collapse_config,
+          progress: progress_reporter("select", total_bytes)
+        )
+      )
+    end
+
+    def stream_to_writer(reader, writer, selection: nil, progress: nil)
       total_records = 0
       record_count = 0
       raw_bytes = 0
@@ -360,7 +388,7 @@ module CDX
       reader.each_capture do |capture, raw_line, source_offset|
         total_records += 1
         raw_bytes += Repack.line_bytes(capture, raw_line)
-        if Repack.keep?(@filters, capture)
+        if Repack.keep?(@filters, capture) && Repack.selected?(selection, capture)
           Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
           writer.write(capture, raw_line: raw_line)
           record_count += 1

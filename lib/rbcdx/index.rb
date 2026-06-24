@@ -7,7 +7,7 @@ module CDX
       Backends::RbCDX
     ].freeze
     CURSOR_UNSET = Object.new.freeze
-    QueryFilters = Struct.new(:checks, :stable_terms, :unstable_count, :named_terms, keyword_init: true) do
+    QueryFilters = Struct.new(:checks, :stable_terms, :unstable_count, :named_terms) do
       def unstable?
         unstable_count.positive?
       end
@@ -42,7 +42,7 @@ module CDX
     end
 
     def captures(url = nil, limit: nil, from: nil, to: nil, filters: nil, fields: nil,
-      closest: nil, match: nil, sort: nil, page_size: nil, cursor: CURSOR_UNSET,
+      closest: nil, match: nil, sort: nil, collapse: nil, collapse_order: nil, page_size: nil, cursor: CURSOR_UNSET,
       filter_signature: nil, &block)
       unless page_size.nil?
         page = run_page_query(
@@ -55,6 +55,8 @@ module CDX
           closest: closest,
           match: match,
           sort: sort,
+          collapse: collapse,
+          collapse_order: collapse_order,
           page_size: page_size,
           cursor: cursor,
           filter_signature: filter_signature
@@ -79,7 +81,9 @@ module CDX
           fields: fields,
           closest: closest,
           match: match,
-          sort: sort
+          sort: sort,
+          collapse: collapse,
+          collapse_order: collapse_order
         )
       end
 
@@ -91,7 +95,7 @@ module CDX
 
     private
 
-    def run_page_query(url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:, page_size:, cursor:, filter_signature:)
+    def run_page_query(url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:, collapse:, collapse_order:, page_size:, cursor:, filter_signature:)
       raise ArgumentError, "choose limit or page_size, not both" unless limit.nil?
       raise UnsupportedPageQuery, "sort is not supported for cursor pages" unless sort.nil?
       raise UnsupportedPageQuery, "closest is not supported for cursor pages" unless closest.nil?
@@ -99,13 +103,30 @@ module CDX
 
       page_size = normalize_page_size(page_size)
       matcher = UrlMatcher.new(url, match: match) if url
+      collapse_config = CaptureCollapse.build(collapse: collapse, collapse_order: collapse_order)
+      validate_collapse_supported!(collapse_config, matcher) if collapse_config
       compiled_filters = compile_query_filters(filters)
       stable_filters = stable_filter_signature(compiled_filters, filter_signature)
       checks = compiled_filters.checks
-      query_digest = CaptureCursor.digest(page_query_signature(url, matcher, from, to, stable_filters))
+      query_digest = CaptureCursor.digest(page_query_signature(url, matcher, from, to, stable_filters, collapse_config))
       index_digest = CaptureCursor.digest(@backend.capture_page_fingerprint)
       cursor = cursor.equal?(CURSOR_UNSET) ? nil : CaptureCursor.coerce(cursor)
       position = page_cursor_position(cursor, index_digest, query_digest)
+
+      if collapse_config
+        return run_collapsed_page_query(
+          matcher: matcher,
+          checks: checks,
+          from: from,
+          to: to,
+          fields: fields,
+          page_size: page_size,
+          position: position,
+          index_digest: index_digest,
+          query_digest: query_digest,
+          collapse_config: collapse_config
+        )
+      end
 
       captures = []
       next_cursor = nil
@@ -123,6 +144,36 @@ module CDX
       CapturePage.new(captures, next_cursor: next_cursor)
     end
 
+    def run_collapsed_page_query(matcher:, checks:, from:, to:, fields:, page_size:, position:, index_digest:, query_digest:, collapse_config:)
+      captures = []
+      next_cursor = nil
+      current_urlkey = nil
+      current_capture = nil
+
+      @backend.each_page_candidate(matcher: matcher, position: position) do |capture, candidate_position|
+        next unless capture_matches?(capture, matcher, checks, from, to)
+
+        urlkey = capture.urlkey.to_s
+        if current_urlkey && urlkey != current_urlkey
+          if captures.length + 1 >= page_size
+            captures << project(current_capture, fields)
+            next_cursor = build_capture_cursor(index_digest, query_digest, candidate_position)
+            break
+          end
+
+          captures << project(current_capture, fields)
+          current_urlkey = urlkey
+          current_capture = capture
+        else
+          current_urlkey ||= urlkey
+          current_capture = capture if CaptureCollapse.better?(capture, current_capture, collapse_config)
+        end
+      end
+
+      captures << project(current_capture, fields) if current_capture && captures.length < page_size && next_cursor.nil?
+      CapturePage.new(captures, next_cursor: next_cursor)
+    end
+
     def normalize_page_size(page_size)
       string = page_size.to_s
       raise ArgumentError, "page_size must be a positive integer" unless string.match?(/\A\d+\z/)
@@ -133,12 +184,25 @@ module CDX
       value
     end
 
-    def run_query(yielder, url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:)
+    def run_query(yielder, url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:, collapse:, collapse_order:)
       matcher = UrlMatcher.new(url, match: match) if url
       checks = compile_query_filters(filters).checks
       limit = normalize_limit(limit)
       sort = validate_sort(sort)
+      collapse_config = CaptureCollapse.build(collapse: collapse, collapse_order: collapse_order)
+      validate_collapse_query_options!(collapse_config, sort: sort, closest: closest)
+      validate_collapse_supported!(collapse_config, matcher) if collapse_config
       return if limit&.zero?
+
+      if collapse_config
+        yielded = 0
+        each_collapsed_matching_capture(matcher, checks, from, to, collapse_config) do |capture|
+          yielder << project(capture, fields)
+          yielded += 1
+          break if limit && yielded >= limit
+        end
+        return
+      end
 
       if closest || sort
         captures = sorted_matching_captures(matcher, checks, from, to, closest: closest, sort: sort, limit: limit)
@@ -154,6 +218,27 @@ module CDX
         yielded += 1
         break if limit && yielded >= limit
       end
+    end
+
+    def each_collapsed_matching_capture(matcher, checks, from, to, collapse_config)
+      return enum_for(:each_collapsed_matching_capture, matcher, checks, from, to, collapse_config) unless block_given?
+
+      current_urlkey = nil
+      current_capture = nil
+      each_capture(matcher: matcher) do |capture|
+        next unless capture_matches?(capture, matcher, checks, from, to)
+
+        urlkey = capture.urlkey.to_s
+        if current_urlkey && urlkey != current_urlkey
+          yield current_capture
+          current_urlkey = urlkey
+          current_capture = capture
+        else
+          current_urlkey ||= urlkey
+          current_capture = capture if CaptureCollapse.better?(capture, current_capture, collapse_config)
+        end
+      end
+      yield current_capture if current_capture
     end
 
     def each_matching_capture(matcher, checks, from, to)
@@ -215,10 +300,10 @@ module CDX
       end
 
       QueryFilters.new(
-        checks: checks,
-        stable_terms: stable_terms.compact,
-        unstable_count: unstable_count,
-        named_terms: named_terms
+        checks,
+        stable_terms.compact,
+        unstable_count,
+        named_terms
       )
     end
 
@@ -247,10 +332,14 @@ module CDX
       entries = []
       filter.each do |field, expected|
         value = stable_filter_value(expected)
-        return unless value
+        unless value
+          entries = nil
+          break
+        end
 
         entries << [field.to_s, value]
       end
+      return unless entries
 
       {"type" => "hash", "entries" => entries.sort_by(&:first)}
     end
@@ -269,8 +358,8 @@ module CDX
       end
     end
 
-    def page_query_signature(url, matcher, from, to, stable_filters)
-      {
+    def page_query_signature(url, matcher, from, to, stable_filters, collapse_config)
+      signature = {
         "cursor_version" => CaptureCursor::VERSION,
         "url" => url&.to_s,
         "match" => matcher&.match&.to_s,
@@ -278,6 +367,8 @@ module CDX
         "to" => Timestamp.normalize(to, high: true),
         "filters" => stable_filters
       }
+      signature["collapse"] = collapse_config.signature if collapse_config
+      signature
     end
 
     def page_cursor_position(cursor, index_digest, query_digest)
@@ -379,6 +470,22 @@ module CDX
       return sort if %i[timestamp reverse_timestamp].include?(sort)
 
       raise ArgumentError, "unsupported sort: #{sort.inspect}"
+    end
+
+    def validate_collapse_query_options!(collapse_config, sort:, closest:)
+      return unless collapse_config
+
+      raise UnsupportedCollapse, "collapse is not supported with sort" unless sort.nil?
+      raise UnsupportedCollapse, "collapse is not supported with closest" unless closest.nil?
+    end
+
+    def validate_collapse_supported!(collapse_config, matcher)
+      return unless collapse_config
+      unless @backend.respond_to?(:validate_urlkey_collapse!)
+        raise UnsupportedCollapse, "collapse: :urlkey is only supported for .rbcdx indexes"
+      end
+
+      @backend.validate_urlkey_collapse!(matcher)
     end
 
     def capture_matches?(capture, matcher, checks, from, to)
