@@ -22,11 +22,11 @@ Gem::Specification.new do |spec|
     "Rakefile",
     "Gemfile",
     "rbcdx.gemspec",
-    "bin/*",
+    "exe/*",
     "doc/**/*.md",
     "lib/**/*.rb"
   ]
-  spec.bindir = "bin"
+  spec.bindir = "exe"
   spec.executables = ["rbcdx"]
   spec.require_paths = ["lib"]
 
