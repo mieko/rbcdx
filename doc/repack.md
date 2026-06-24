@@ -55,7 +55,7 @@ opened normally as packed rbcdx indexes.
 Use `--dry-run` to preview a repack without writing files:
 
 ```sh
-rbcdx repack --filter extractable-text --dry-run
+rbcdx repack --filter extractable_text --dry-run
 ```
 
 Dry runs print the output file each input would create. With
@@ -76,13 +76,14 @@ It is removed after a successful batch.
 
 ## Filtering
 
-Named repack filters are useful presets:
+Named repack filters are useful presets. These names are shared with query-time
+filters; see [Querying](query.md) for the Ruby and `rbcdx captures` surfaces.
 
 ```sh
-rbcdx repack --filter extractable-text
+rbcdx repack --filter extractable_text
 ```
 
-`extractable-text` keeps normal WARC-backed `200` captures whose MIME type
+`extractable_text` keeps normal WARC-backed `200` captures whose MIME type
 looks text-extractable, while dropping obvious assets and site metadata such as
 images, scripts, stylesheets, fonts, PDFs, `robots.txt`, sitemaps, and web
 manifests.
@@ -91,19 +92,19 @@ Built-in named filters are:
 
 | Filter | Meaning |
 | --- | --- |
-| `status-200` | CDX status is `200` |
+| `status_200` | CDX status is `200` |
 | `warc` | Record points at a normal `/warc/` object |
 | `html` | `mime` or `mime-detected` contains `text/html` |
-| `text-like` | `text/plain`, Markdown MIME types, `text/html`, `text/xml`, `application/xml`, `application/xhtml+xml`, and RSS/Atom/RDF XML MIME types; intentionally does not match every `+xml` MIME type, because Common Crawl includes XML-backed playlists, map files, and media descriptors |
-| `asset-like` | Images, audio, video, fonts, CSS, JavaScript, PDFs, or common static-file extensions such as `.jpg`, `.png`, `.gif`, `.svg`, `.css`, `.js`, `.woff2`, `.mp4`, and `.zip` |
-| `site-metadata` | `robots.txt`, manifests, `.well-known` metadata, or sitemap-looking XML files, including names that contain `sitemap` and either end in `.xml`/`.xml.gz` or have an XML-ish reported or detected MIME type |
-| `extractable-text` | Combines `status-200`, `warc`, `text-like`, `-asset-like`, and `-site-metadata` |
+| `text_like` | `text/plain`, Markdown MIME types, `text/html`, `text/xml`, `application/xml`, `application/xhtml+xml`, and RSS/Atom/RDF XML MIME types; intentionally does not match every `+xml` MIME type, because Common Crawl includes XML-backed playlists, map files, and media descriptors |
+| `asset_like` | Images, audio, video, fonts, CSS, JavaScript, PDFs, or common static-file extensions such as `.jpg`, `.png`, `.gif`, `.svg`, `.css`, `.js`, `.woff2`, `.mp4`, and `.zip` |
+| `site_metadata` | `robots.txt`, manifests, `.well-known` metadata, or sitemap-looking XML files, including names that contain `sitemap` and either end in `.xml`/`.xml.gz` or have an XML-ish reported or detected MIME type |
+| `extractable_text` | Combines `status_200`, `warc`, `text_like`, `-asset_like`, and `-site_metadata` |
 
 Use `+name` to require a named filter and `-name` to exclude records matching a
 named filter. For example, this is equivalent to the preset above:
 
 ```sh
-rbcdx repack --filter +status-200,+warc,+text-like,-asset-like,-site-metadata
+rbcdx repack --filter +status_200,+warc,+text_like,-asset_like,-site_metadata
 ```
 
 Use `--where` for normal CDX field filters:
@@ -118,7 +119,7 @@ rbcdx repack --output-dir ./rbcdx-200 --where '=status:200' ./indexes/CC-MAIN-20
 repack as a streaming filter:
 
 ```sh
-rbcdx repack --output-format cdxj --filter extractable-text --output-dir ./filtered ./indexes/CC-MAIN-2026-25
+rbcdx repack --output-format cdxj --filter extractable_text --output-dir ./filtered ./indexes/CC-MAIN-2026-25
 ```
 
 In CDXJ mode, `--output-format` controls the record format. For single-file

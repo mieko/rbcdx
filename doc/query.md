@@ -1,0 +1,126 @@
+# Querying
+
+`CDX::Index#captures` queries local CDX/CDXJ or packed `.rbcdx` index files and
+returns `CDX::Capture` records. Query filters can be CDX field filters or shared
+named capture filters.
+
+## Ruby Filters
+
+Use CDX field-filter strings when matching index fields directly:
+
+```ruby
+index.captures("example.com/news/*", filters: "=status:200")
+index.captures("example.com/news/*", filters: ["=status:200", "~mime:text/.+"])
+```
+
+Use symbols for shared named filters:
+
+```ruby
+index.captures(
+  "example.com/news/*",
+  match: :prefix,
+  filters: :extractable_text
+)
+
+index.captures(
+  "example.com/news/*",
+  match: :prefix,
+  filters: [:status_200, :warc, :html]
+)
+```
+
+Ruby strings are always parsed as CDX field filters, not named filters. Use
+`filters: :extractable_text`, not `filters: "extractable_text"`. Hyphenated
+names such as `:"extractable-text"` are not accepted.
+
+Named filters can be mixed with field filters:
+
+```ruby
+index.captures(
+  "example.com/news/*",
+  match: :prefix,
+  filters: ["~url:/news/", :extractable_text]
+)
+```
+
+Ruby symbol named filters are positive terms. For custom negative query logic,
+pass a callable filter and provide `filter_signature:` when using cursor pages.
+
+## Built-In Named Filters
+
+The built-in named filters are shared with repack filtering:
+
+| Filter | Meaning |
+| --- | --- |
+| `status_200` | CDX status is `200` |
+| `warc` | Record points at a normal `/warc/` object |
+| `html` | `mime` or `mime-detected` contains `text/html` |
+| `text_like` | Common text, HTML, XML, XHTML, RSS, Atom, and RDF MIME types |
+| `asset_like` | Images, audio, video, fonts, CSS, JavaScript, PDFs, or common static-file extensions |
+| `site_metadata` | `robots.txt`, manifests, `.well-known` metadata, or sitemap-looking XML files |
+| `extractable_text` | Combines `status_200`, `warc`, `text_like`, `-asset_like`, and `-site_metadata` |
+
+`extractable_text` is a capture-metadata heuristic. It is useful for discovery
+passes that want likely parseable text payloads, but it does not guarantee that
+the fetched WARC payload parses as article text.
+
+## CLI Filters
+
+`rbcdx captures --filter` accepts CDX field filters and named filter
+expressions:
+
+```sh
+rbcdx captures --index ./indexes/CC-MAIN-2026-25 --filter extractable_text 'example.com/news/*'
+rbcdx captures --index ./indexes/CC-MAIN-2026-25 --filter '+status_200,+warc,+text_like,-asset_like' 'example.com/news/*'
+rbcdx captures --index ./indexes/CC-MAIN-2026-25 --filter '=status:200' --filter html 'example.com/news/*'
+```
+
+For query CLI filters, strings with `:` are CDX field filters and no-colon
+terms are named filters. Multiple `--filter` flags may mix the two forms. A
+comma-separated expression that starts with a named term can include later field
+filters, for example:
+
+```sh
+rbcdx captures --filter 'html,~url:get-started' 'example.com/*'
+```
+
+`rbcdx repack --filter` always parses named filter expressions. Use
+`rbcdx repack --where` for CDX field filters during repack.
+
+## Cursor Pages
+
+Pass `page_size:` to `captures` for resumable page mode over packed `.rbcdx`
+indexes:
+
+```ruby
+page = index.captures(
+  "dailyadvance.com/news/local/*",
+  match: :prefix,
+  filters: :extractable_text,
+  page_size: 500,
+  cursor: saved_cursor
+)
+```
+
+Cursor query signatures use canonical underscore names for named filters. For
+example, `filters: [:status_200, :warc]` signs the named-filter portion as:
+
+```json
+["status_200", "warc"]
+```
+
+CLI negative terms preserve polarity, so
+`+status_200,+warc,+text_like,-asset_like` signs as:
+
+```json
+["status_200", "warc", "text_like", "-asset_like"]
+```
+
+When named filters are present, the cursor query signature also includes the
+named-filter vocabulary version. This deliberately invalidates affected cursors
+if the built-in named-filter predicates change in the future.
+
+Named symbols and CLI named terms do not require caller-provided
+`filter_signature:`. Procs and other unstable filters still require a stable
+`filter_signature:` in page mode so rbcdx can reject cursors from a different
+logical query.

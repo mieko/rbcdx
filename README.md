@@ -124,12 +124,20 @@ index.captures(
   to: "202607",
   closest: "20260615000000",
   sort: :reverse_timestamp,
-  filters: {"mime" => /html/}
+  filters: [:status_200, :html]
 )
 ```
 
-Filters can be strings (`=status:200`, `!=status:404`, `~mime:text/.+`),
-hashes, or procs. `sort:` accepts `:timestamp` or `:reverse_timestamp`.
+Filters can be CDX field-filter strings (`=status:200`, `!=status:404`,
+`~mime:text/.+`), hashes, procs, or named-filter symbols such as
+`:status_200`, `:html`, or `:extractable_text`. Ruby strings are always field
+filters; use symbols for named filters in code.
+
+Built-in named filters are `status_200`, `html`, `text_like`, `asset_like`,
+`site_metadata`, `warc`, and `extractable_text`. The `extractable_text` preset
+keeps normal WARC-backed `200` captures whose MIME type looks text-extractable,
+while dropping obvious assets and site metadata. `sort:` accepts `:timestamp` or
+`:reverse_timestamp`.
 
 When a Common Crawl `cluster.idx` file is in the directory with `cdx-*.gz`
 shards, rbcdx uses it automatically to avoid scanning unrelated CDXJ blocks for
@@ -148,7 +156,7 @@ cursor = saved_cursor
 loop do
   page = index.captures(
     "example.com/news/*",
-    filters: "=status:200",
+    filters: :extractable_text,
     page_size: 500,
     cursor: cursor
   )
@@ -174,7 +182,11 @@ returned in the page but not processed.
 Cursor pages are returned in native index order. They currently support packed
 `.rbcdx` indexes only; CDX/CDXJ, gzip, `sort:`, and `closest:` are not resumable
 yet. Procs or other unstable filters require `filter_signature:` so rbcdx can
-tell whether a saved cursor belongs to the same logical query.
+tell whether a saved cursor belongs to the same logical query. Named filters
+participate automatically in cursor query signatures with their canonical
+underscore names; for example `filters: [:status_200, :warc]` is signed as
+`["status_200", "warc"]`. For more query filter details, see
+[Querying](doc/query.md).
 
 ## Capture Objects
 
@@ -324,7 +336,8 @@ output paths are written to stdout, one per line, so scripts can consume them.
 a directory containing both `cdx-*.gz` and `.rbcdx` files should be treated as a
 migration workspace, not as a queryable index.
 
-For dry-run, resume, filtering, same-format output, and single-file repack
+For query filtering and cursor signatures, see [Querying](doc/query.md). For
+dry-run, resume, repack filtering, same-format output, and single-file repack
 details, see [Repacking](doc/repack.md).
 
 ## What rbcdx Does Not Do
@@ -343,6 +356,7 @@ Parquet/ORC URL indexes as capture indexes.
 - rbcdx streams CDX/CDXJ files and seeks within packed `.rbcdx` indexes.
 - `cluster.idx`, when present, is used automatically for CDX/CDXJ queries.
 - rbcdx builds WARC object URLs and range headers; it does not parse WARC records.
+- Query filters and cursor signatures are documented in [`doc/query.md`](doc/query.md).
 - The `.rbcdx` on-disk format is documented in [`doc/rbcdx-format.md`](doc/rbcdx-format.md).
 - Inspired by Common Crawl's [`cdx_toolkit`](https://github.com/commoncrawl/cdx_toolkit).
 
