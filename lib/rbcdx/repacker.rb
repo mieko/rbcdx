@@ -273,6 +273,7 @@ module CDX
       block_bytes: Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES, max_records: Backends::RbCDX::Format::DEFAULT_MAX_RECORDS,
       restart_interval: Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL, zstd_level: 6,
       filters: nil, where: nil, filter_signature: nil, filter_registry: RepackFilters::DEFAULT_REGISTRY,
+      only_url_files: nil, only_url_filter: nil,
       collapse: nil, collapse_order: nil, selected_line_numbers: nil,
       atomic: true, verify: true, force: false, metadata: nil, progress: nil)
       @input_path = File.expand_path(input_path)
@@ -281,8 +282,14 @@ module CDX
       @writer_class = self.class.writers.fetch(@output_format) do
         raise ArgumentError, "unsupported output format: #{output_format.inspect}"
       end
-      @filter_signature = filter_signature || inferred_filter_signature(filters, where, filter_registry)
-      @filters = RepackFilters.build(filters, registry: filter_registry, where: where)
+      precomputed_filter_signature = !only_url_filter.nil? && !filter_signature.nil?
+      @only_url_filter = only_url_filter || only_url_filter_from_files(only_url_files)
+      @filter_signature = if precomputed_filter_signature
+        filter_signature
+      else
+        inferred_filter_signature(filters, where, filter_registry, filter_signature, @only_url_filter)
+      end
+      @filters = RepackFilters.build(filters, registry: filter_registry, where: where, only_url_filter: @only_url_filter)
       @collapse_config = CaptureCollapse.build(collapse: collapse, collapse_order: collapse_order)
       @collapse_signature = @collapse_config&.signature
       @selected_line_numbers = selected_line_numbers
@@ -358,10 +365,22 @@ module CDX
 
     private
 
-    def inferred_filter_signature(filters, where, filter_registry)
-      RepackFilters.stable_signature(filters: filters, where: where, registry: filter_registry)
+    def inferred_filter_signature(filters, where, filter_registry, filter_signature, only_url_filter)
+      RepackFilters.stable_signature(
+        filters: filters,
+        where: where,
+        registry: filter_registry,
+        filter_signature: filter_signature,
+        only_url_filter: only_url_filter
+      )
     rescue ArgumentError
       nil
+    end
+
+    def only_url_filter_from_files(only_url_files)
+      return if only_url_files.nil?
+
+      OnlyUrlFilter.from_files(only_url_files)
     end
 
     def line_selection(reader, total_bytes)

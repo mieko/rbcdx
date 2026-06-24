@@ -4,29 +4,40 @@ module CDX
 
     module_function
 
-    def build(filters, registry: DEFAULT_REGISTRY, where: nil)
-      CaptureFilters.build(filters, registry: registry, label: "repack filter") + build_where(where)
+    def build(filters, registry: DEFAULT_REGISTRY, where: nil, only_url_files: nil, only_url_filter: nil)
+      checks = CaptureFilters.build(filters, registry: registry, label: "repack filter") + build_where(where)
+      only_urls = only_url_filter || only_url_filter_from_files(only_url_files)
+      checks << only_urls if only_urls
+      checks
     end
 
     def build_where(filters)
       Filter.build(filters).map { |filter| ->(record) { filter.call(record) } }
     end
 
-    def stable_signature(filters: nil, where: nil, filter_signature: nil, registry: DEFAULT_REGISTRY)
-      return filter_signature if filter_signature
+    def stable_signature(filters: nil, where: nil, filter_signature: nil, registry: DEFAULT_REGISTRY, only_url_files: nil, only_url_filter: nil)
+      only_urls = only_url_filter || only_url_filter_from_files(only_url_files)
+      if filter_signature
+        return filter_signature unless only_urls
+
+        return {
+          "custom" => filter_signature,
+          "only_url_files" => only_urls.signature
+        }
+      end
 
       filter_terms = stable_terms(filters, "repack filter", registry: registry)
       signature = {
         "filters" => filter_terms,
         "where" => stable_terms(where, "where filter")
       }
+      signature["only_url_files"] = only_urls.signature if only_urls
       signature["named_filter_version"] = CaptureFilters::VOCABULARY_VERSION if filter_terms.any? && registry.equal?(DEFAULT_REGISTRY)
       signature
     end
 
-    def stable_signature?(filters: nil, where: nil, registry: DEFAULT_REGISTRY)
-      stable_terms(filters, "repack filter", registry: registry)
-      stable_terms(where, "where filter")
+    def stable_signature?(filters: nil, where: nil, registry: DEFAULT_REGISTRY, only_url_files: nil)
+      stable_signature(filters: filters, where: where, registry: registry, only_url_files: only_url_files)
       true
     rescue ArgumentError
       false
@@ -50,6 +61,12 @@ module CDX
       true
     rescue ArgumentError
       false
+    end
+
+    def only_url_filter_from_files(only_url_files)
+      return if only_url_files.nil?
+
+      OnlyUrlFilter.from_files(only_url_files)
     end
 
     def parse_expression(expression, registry)

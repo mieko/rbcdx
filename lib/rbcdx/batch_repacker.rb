@@ -89,7 +89,8 @@ module CDX
     def initialize(inputs, output_dir:, output_format: "rbcdx", block_bytes: Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES,
       max_records: Backends::RbCDX::Format::DEFAULT_MAX_RECORDS, restart_interval: Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL,
       zstd_level: 6, filters: nil, where: nil, filter_signature: nil, resume: false, force: false,
-      dry_run: false, delete_when_processed: false, manifest: true, collapse: nil, collapse_order: nil, progress: nil)
+      dry_run: false, delete_when_processed: false, manifest: true, collapse: nil, collapse_order: nil,
+      only_url_files: nil, progress: nil)
       @input_specs = Array(inputs).flatten.compact.map(&:to_s)
       @output_dir = File.expand_path(output_dir)
       @output_format = output_format.to_s
@@ -101,8 +102,14 @@ module CDX
       @zstd_level = rbcdx? ? decimal_option("zstd_level", zstd_level) : zstd_level
       @filters = filters
       @where = where
-      @compiled_filters = RepackFilters.build(filters, where: where)
-      @filter_signature = filter_signature || inferred_filter_signature(resume: resume, delete_when_processed: delete_when_processed)
+      @only_url_files = only_url_files.nil? ? nil : Array(only_url_files).flatten.compact.map(&:to_s)
+      @only_url_filter = only_url_filter_from_files(@only_url_files)
+      @compiled_filters = RepackFilters.build(filters, where: where, only_url_filter: @only_url_filter)
+      @filter_signature = inferred_filter_signature(
+        filter_signature: filter_signature,
+        resume: resume,
+        delete_when_processed: delete_when_processed
+      )
       @collapse_config = CaptureCollapse.build(collapse: collapse, collapse_order: collapse_order)
       @collapse_signature = @collapse_config&.signature
       @selection_by_input = {}
@@ -161,10 +168,21 @@ module CDX
       string.to_i
     end
 
-    def inferred_filter_signature(resume:, delete_when_processed:)
-      RepackFilters.stable_signature(filters: @filters, where: @where)
+    def inferred_filter_signature(filter_signature:, resume:, delete_when_processed:)
+      RepackFilters.stable_signature(
+        filters: @filters,
+        where: @where,
+        filter_signature: filter_signature,
+        only_url_filter: @only_url_filter
+      )
     rescue ArgumentError
       raise if resume || delete_when_processed
+    end
+
+    def only_url_filter_from_files(only_url_files)
+      return if only_url_files.nil?
+
+      OnlyUrlFilter.from_files(only_url_files)
     end
 
     def discover_entries(state: nil)
@@ -454,6 +472,7 @@ module CDX
         output_format: @output_format,
         filters: @filters,
         where: @where,
+        only_url_filter: @only_url_filter,
         filter_signature: @filter_signature,
         collapse: collapse_field,
         collapse_order: collapse_order,
@@ -588,6 +607,7 @@ module CDX
           output_format: @output_format,
           filters: @filters,
           where: @where,
+          only_url_filter: @only_url_filter,
           filter_signature: @filter_signature,
           collapse: collapse_field,
           collapse_order: collapse_order,
