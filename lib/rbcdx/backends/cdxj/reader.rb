@@ -9,9 +9,9 @@ module CDX
 
         def self.open_path(path)
           if path.end_with?(".gz")
-            open_gzip_path(path) { |gzip| yield gzip }
+            open_gzip_path(path) { |gzip, position| yield gzip, position }
           else
-            File.open(path, "r:utf-8") { |file| yield file }
+            File.open(path, "r:utf-8") { |file| yield file, -> { file.pos } }
           end
         end
 
@@ -41,7 +41,7 @@ module CDX
             unused = nil
             until file.eof? && unused.to_s.empty?
               gzip = Zlib::GzipReader.new(PrependedIO.new(unused, file))
-              yield gzip
+              yield gzip, -> { file.pos }
               unused = gzip.unused
               gzip.finish
             end

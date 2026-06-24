@@ -8,19 +8,23 @@ module CDX
           @path = File.expand_path(path)
         end
 
+        def bytesize
+          File.size(path)
+        end
+
         def each_capture
           return enum_for(:each_capture) unless block_given?
 
           parser = Parser.new
           previous_urlkey = nil
-          each_line do |line, line_number|
+          each_line do |line, line_number, source_offset|
             data = parse_line(parser, line, line_number)
             next unless data
 
             capture = CDX::Capture.new(data, source_path: path, line_number: line_number)
             validate_sorted!(capture, previous_urlkey)
             previous_urlkey = capture.urlkey
-            yield capture, raw_cdxj_line(line)
+            yield capture, raw_cdxj_line(line), source_offset
           end
         end
 
@@ -73,10 +77,10 @@ module CDX
 
         def each_line
           line_number = 0
-          Reader.open_path(path) do |io|
+          Reader.open_path(path) do |io, position|
             io.each_line do |line|
               line_number += 1
-              yield line, line_number
+              yield line, line_number, position&.call
             end
           end
         end

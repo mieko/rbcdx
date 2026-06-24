@@ -150,7 +150,8 @@ module CDX
         zstd_level: options.fetch(:zstd_level, 6),
         filters: options.fetch(:filters),
         where: options.fetch(:where),
-        force: options.fetch(:force, false)
+        force: options.fetch(:force, false),
+        progress: ->(event, **payload) { progress.call(event, entry: entry, index: 1, total: 1, **payload) }
       )
       progress.call(:finish, entry: entry, index: 1, total: 1)
       @out.puts result.path
@@ -787,9 +788,11 @@ module CDX
     class RepackProgress
       def initialize(io)
         @io = io
+        @progress_starts = {}
       end
 
-      def call(event, entry: nil, index: nil, total: nil, preview: nil, path: nil, entries: nil)
+      def call(event, entry: nil, index: nil, total: nil, preview: nil, path: nil, entries: nil,
+        phase: nil, processed_bytes: nil, total_bytes: nil, total_records: nil, selected_records: nil)
         case event
         when :state_start
           @io.puts "creating repack state #{path}"
@@ -805,6 +808,17 @@ module CDX
           @io.puts "filtered [#{index}/#{total}] #{entry.input_path}: #{preview.record_count} of #{preview.total_records} records passed filters"
         when :start
           @io.puts "processing [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
+        when :progress
+          @io.puts progress_line(
+            entry,
+            index,
+            total,
+            phase,
+            processed_bytes,
+            total_bytes,
+            total_records,
+            selected_records
+          )
         when :finish
           @io.puts "written [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         when :skip
@@ -814,6 +828,45 @@ module CDX
         when :fail
           @io.puts "failed [#{index}/#{total}] #{entry.input_path} -> #{entry.output_path}"
         end
+      end
+
+      private
+
+      def progress_line(entry, index, total, phase, processed_bytes, total_bytes, total_records, selected_records)
+        line = "progress [#{index}/#{total}] #{entry.input_path}"
+        line << " #{phase}" if phase
+        line << " #{format_bytes(processed_bytes)}"
+        if total_bytes.to_i.positive?
+          line << " / #{format_bytes(total_bytes)} (#{processed_bytes.to_i * 100 / total_bytes.to_i}%)"
+          eta = eta_for([entry.input_path, phase], processed_bytes.to_i, total_bytes.to_i)
+          line << " eta #{eta}" if eta
+        end
+        line << " #{selected_records.to_i} of #{total_records.to_i} records selected" if total_records
+        line
+      end
+
+      def eta_for(key, processed_bytes, total_bytes)
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        started_at, started_bytes = (@progress_starts[key] ||= [now, processed_bytes])
+        elapsed = now - started_at
+        done = processed_bytes - started_bytes
+        return nil unless elapsed.positive? && done.positive? && processed_bytes < total_bytes
+
+        format_duration(((total_bytes - processed_bytes) / (done / elapsed)).round)
+      end
+
+      def format_duration(seconds)
+        if seconds >= 3600
+          format("%dh%02dm", seconds / 3600, (seconds % 3600) / 60)
+        elsif seconds >= 60
+          format("%dm%02ds", seconds / 60, seconds % 60)
+        else
+          "#{seconds}s"
+        end
+      end
+
+      def format_bytes(bytes)
+        format("%.1f MiB", bytes.to_i / 1024.0 / 1024)
       end
     end
   end

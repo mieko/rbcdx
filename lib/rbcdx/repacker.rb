@@ -5,6 +5,9 @@ require "tempfile"
 
 module CDX
   module Repack
+    PROGRESS_INTERVAL_BYTES = 64 * 1024 * 1024
+    PROGRESS_INTERVAL_SECONDS = 10
+
     Summary = Struct.new(
       :record_count,
       :total_records,
@@ -30,8 +33,8 @@ module CDX
         nil
       end
 
-      def preview(reader, filters)
-        summarize(reader, filters)
+      def preview(reader, filters, progress: nil)
+        summarize(reader, filters, progress: progress)
       end
 
       def cleanup
@@ -39,21 +42,24 @@ module CDX
 
       private
 
-      def summarize(reader, filters, validate: nil)
+      def summarize(reader, filters, validate: nil, progress: nil)
         total_records = 0
         record_count = 0
         raw_bytes = 0
         fingerprint = Repack.new_selected_fingerprint
 
-        reader.each_capture do |capture, raw_line|
+        progress&.call(processed_bytes: 0, total_records: total_records, selected_records: record_count)
+        reader.each_capture do |capture, raw_line, source_offset|
           total_records += 1
           raw_bytes += Repack.line_bytes(capture, raw_line)
-          next unless Repack.keep?(filters, capture)
-
-          validate&.call(capture, raw_line)
-          Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
-          record_count += 1
+          if Repack.keep?(filters, capture)
+            validate&.call(capture, raw_line)
+            Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
+            record_count += 1
+          end
+          progress&.call(processed_bytes: source_offset, total_records: total_records, selected_records: record_count)
         end
+        progress&.call(processed_bytes: reader.bytesize, total_records: total_records, selected_records: record_count, final: true)
 
         Summary.new(
           record_count: record_count,
@@ -156,6 +162,31 @@ module CDX
         "ino" => stat.ino
       }
     end
+
+    def progress_reporter(progress, phase:, total_bytes:)
+      return nil unless progress
+
+      last_bytes = -PROGRESS_INTERVAL_BYTES
+      last_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - PROGRESS_INTERVAL_SECONDS
+      lambda do |processed_bytes:, total_records:, selected_records:, final: false|
+        processed_bytes = [processed_bytes.to_i, total_bytes].min
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        next unless final ||
+          processed_bytes - last_bytes >= PROGRESS_INTERVAL_BYTES ||
+          now - last_time >= PROGRESS_INTERVAL_SECONDS
+
+        last_bytes = processed_bytes
+        last_time = now
+        progress.call(
+          :progress,
+          phase: phase,
+          processed_bytes: processed_bytes,
+          total_bytes: total_bytes,
+          total_records: total_records,
+          selected_records: selected_records
+        )
+      end
+    end
   end
 
   class Repacker
@@ -238,7 +269,7 @@ module CDX
       block_bytes: Backends::RbCDX::Format::DEFAULT_BLOCK_BYTES, max_records: Backends::RbCDX::Format::DEFAULT_MAX_RECORDS,
       restart_interval: Backends::RbCDX::Format::DEFAULT_RESTART_INTERVAL, zstd_level: 6,
       filters: nil, where: nil, filter_signature: nil, filter_registry: RepackFilters::DEFAULT_REGISTRY,
-      atomic: true, verify: true, force: false, metadata: nil)
+      atomic: true, verify: true, force: false, metadata: nil, progress: nil)
       @input_path = File.expand_path(input_path)
       @output_path = File.expand_path(output_path)
       @output_format = output_format.to_s
@@ -248,6 +279,7 @@ module CDX
       @filter_signature = filter_signature || inferred_filter_signature(filters, where)
       @filters = RepackFilters.build(filters, registry: filter_registry, where: where)
       @force = force
+      @progress = progress
       @writer_options = {
         block_bytes: block_bytes,
         max_records: max_records,
@@ -268,11 +300,12 @@ module CDX
       reader = Backends::CDXJ::RepackReader.new(@input_path)
       writer = @writer_class.new(@output_path, **@writer_options)
       source_signature = current_source_signature
-      prepared = writer.prepare(reader, @filters) if writer.needs_prepare?
+      total_bytes = source_signature.fetch("bytes")
+      prepared = writer.prepare(reader, @filters, progress: progress_reporter("prepare", total_bytes)) if writer.needs_prepare?
       ensure_source_unchanged!(source_signature) if writer.needs_prepare?
 
       writer.start(prepared)
-      summary = stream_to_writer(reader, writer)
+      summary = stream_to_writer(reader, writer, progress: progress_reporter("write", total_bytes))
       ensure_source_unchanged!(source_signature)
       writer.finish(
         summary: summary,
@@ -295,7 +328,7 @@ module CDX
       reader = Backends::CDXJ::RepackReader.new(@input_path)
       writer = @writer_class.new(@output_path, **@writer_options)
       source_signature = current_source_signature
-      summary = writer.preview(reader, @filters)
+      summary = writer.preview(reader, @filters, progress: progress_reporter("preview", source_signature.fetch("bytes")))
       ensure_source_unchanged!(source_signature)
       Preview.new(
         @output_path,
@@ -317,21 +350,24 @@ module CDX
       nil
     end
 
-    def stream_to_writer(reader, writer)
+    def stream_to_writer(reader, writer, progress: nil)
       total_records = 0
       record_count = 0
       raw_bytes = 0
       fingerprint = Repack.new_selected_fingerprint
 
-      reader.each_capture do |capture, raw_line|
+      progress&.call(processed_bytes: 0, total_records: total_records, selected_records: record_count)
+      reader.each_capture do |capture, raw_line, source_offset|
         total_records += 1
         raw_bytes += Repack.line_bytes(capture, raw_line)
-        next unless Repack.keep?(@filters, capture)
-
-        Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
-        writer.write(capture, raw_line: raw_line)
-        record_count += 1
+        if Repack.keep?(@filters, capture)
+          Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
+          writer.write(capture, raw_line: raw_line)
+          record_count += 1
+        end
+        progress&.call(processed_bytes: source_offset, total_records: total_records, selected_records: record_count)
       end
+      progress&.call(processed_bytes: reader.bytesize, total_records: total_records, selected_records: record_count, final: true)
 
       Repack::Summary.new(
         record_count: record_count,
@@ -349,6 +385,10 @@ module CDX
       input_dir = canonical_directory(File.dirname(@input_path))
       output_dir = canonical_directory(File.dirname(@output_path))
       input_dir == output_dir && File.basename(@input_path) == File.basename(@output_path)
+    end
+
+    def progress_reporter(phase, total_bytes)
+      Repack.progress_reporter(@progress, phase: phase, total_bytes: total_bytes)
     end
 
     def existing_same_file?(left, right)

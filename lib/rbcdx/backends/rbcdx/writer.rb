@@ -56,23 +56,28 @@ module CDX
           true
         end
 
-        def prepare(reader, filters)
+        def prepare(reader, filters, progress: nil)
           tables = Format::TABLE_NAMES.to_h { |name| [name, Set.new] }
           crawl_id_state = {}
+          total_records = 0
           count = 0
           raw_bytes = 0
           fingerprint = Repack.new_selected_fingerprint
 
-          reader.each_capture do |capture, raw_line|
+          progress&.call(processed_bytes: 0, total_records: total_records, selected_records: count)
+          reader.each_capture do |capture, raw_line, source_offset|
+            total_records += 1
             raw_bytes += Repack.line_bytes(capture, raw_line)
-            next unless Repack.keep?(filters, capture)
-
-            urlkey, _timestamp, object = capture_parts(capture)
-            Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
-            Format.validate_cdxj_object(capture.source_path, capture.line_number, urlkey, object)
-            count += 1
-            collect_tables(tables, capture, object, crawl_id_state)
+            if Repack.keep?(filters, capture)
+              urlkey, _timestamp, object = capture_parts(capture)
+              Repack.fingerprint_selected_record(fingerprint, capture, raw_line)
+              Format.validate_cdxj_object(capture.source_path, capture.line_number, urlkey, object)
+              count += 1
+              collect_tables(tables, capture, object, crawl_id_state)
+            end
+            progress&.call(processed_bytes: source_offset, total_records: total_records, selected_records: count)
           end
+          progress&.call(processed_bytes: reader.bytesize, total_records: total_records, selected_records: count, final: true)
 
           {
             tables: tables,
@@ -83,12 +88,12 @@ module CDX
           }
         end
 
-        def preview(reader, filters)
+        def preview(reader, filters, progress: nil)
           maps = Format::TABLE_NAMES.to_h { |name| [name, PreviewDictionaryMap.new] }
           crawl_id_state = {}
           summarize(reader, filters, validate: ->(capture, _raw_line) {
             build_record(capture, maps, crawl_id_state)
-          })
+          }, progress: progress)
         end
 
         def start(prepared)

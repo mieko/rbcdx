@@ -620,6 +620,27 @@ class RepackerTest < Minitest::Test
     end
   end
 
+  def test_repack_progress_reports_prepare_and_write_phases
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      events = []
+
+      CDX::Repacker.repack(
+        input,
+        output,
+        progress: ->(event, **payload) { events << [event, payload] }
+      )
+
+      progress_events = events.filter_map { |event, payload| payload if event == :progress }
+      assert_includes progress_events.map { |payload| payload.fetch(:phase) }, "prepare"
+      assert_includes progress_events.map { |payload| payload.fetch(:phase) }, "write"
+      assert progress_events.any? { |payload| payload.fetch(:processed_bytes) == File.size(input) }
+      assert progress_events.any? { |payload| payload.fetch(:selected_records) == 3 }
+    end
+  end
+
   def test_repack_many_rebuilds_manifest_once_after_batch_even_when_deleting_sources
     Dir.mktmpdir do |dir|
       input_dir = File.join(dir, "cdx")
@@ -1551,6 +1572,8 @@ class RepackerTest < Minitest::Test
       assert_equal 0, status
       assert_match(/sample\.rbcdx/, out.string)
       assert_match(/processing \[1\/1\]/, err.string)
+      assert_match(/progress \[1\/1\].* prepare /, err.string)
+      assert_match(/progress \[1\/1\].* write /, err.string)
       assert_match(/written \[1\/1\]/, err.string)
       assert_equal ["https://example.com/about", "https://blog.example.com/post"], CDX::Index.open(File.join(output_dir, "sample.rbcdx")).map(&:url)
     end

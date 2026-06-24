@@ -346,7 +346,8 @@ module CDX
         atomic: true,
         verify: true,
         force: @force,
-        metadata: {"batch_plan" => plan_signature}
+        metadata: {"batch_plan" => plan_signature},
+        progress: entry_progress(entry, index, total)
       )
       record_result(entry, result)
       raise Error, "new output does not match this repack plan: #{output_path}" unless matching_output?(entry)
@@ -577,6 +578,12 @@ module CDX
 
     def emit_progress(event, **payload)
       @progress&.call(event, **payload)
+    end
+
+    def entry_progress(entry, index, total)
+      lambda do |event, **payload|
+        emit_progress(event, entry: entry, index: index, total: total, **payload)
+      end
     end
 
     def rbcdx?
