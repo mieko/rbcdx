@@ -9,7 +9,7 @@ for fetching WARC records from a remote archive such as Common Crawl.
 ```ruby
 require "rbcdx"
 
-index = CDX::Index.open("./indexes/CC-MAIN-2026-25/cdx-*.gz")
+index = CDX::Index.open("./indexes/CC-MAIN-2026-25")
 capture = index.captures("reddit.com/", closest: "202606").first
 
 puts capture.url
@@ -33,10 +33,10 @@ gem "rbcdx", git: "https://github.com/mieko/rbcdx.git", ref: "COMMIT_SHA"
 
 ## CDX/CDXJ Indexes
 
-The normal path is to read existing CDX/CDXJ index files directly:
+The normal path is to point `CDX::Index` at a directory of local index files:
 
 ```ruby
-index = CDX::Index.open("./indexes/CC-MAIN-2026-25/cdx-*.gz")
+index = CDX::Index.open("./indexes/CC-MAIN-2026-25")
 
 index.captures("commoncrawl.org/*", limit: 10, filters: "=status:200") do |capture|
   puts [capture.status, capture.timestamp, capture.url].join(" ")
@@ -50,15 +50,18 @@ urls = index.captures("*.commoncrawl.org", match: :domain).map(&:url)
 count = index.captures("example.com/*").count
 ```
 
-Supported local inputs:
+Directories are preferred because `rbcdx` can discover the supported index
+files and any lookup metadata beside them. Files and globs are still supported
+when you want tighter control:
 
 | Input | Example |
 | --- | --- |
+| Directory | `indexes/CC-MAIN-2026-25` |
+| Glob | `indexes/CC-MAIN-2026-25/cdx-*.gz` |
 | Common Crawl CDXJ shard | `cdx-00000.gz` |
 | CDX/CDXJ text file | `captures.cdxj` |
 | gzip-compressed CDX/CDXJ file | `captures.cdxj.gz` |
 | Packed rbcdx index, after repacking | `cdx-00000.rbcdx` |
-| Glob or directory | `indexes/*.gz`, `indexes/CC-MAIN-2026-25` |
 
 Supported URL patterns:
 
@@ -82,9 +85,9 @@ index.captures(
 Filters can be strings (`=status:200`, `!=status:404`, `~mime:text/.+`),
 hashes, or procs. `sort:` accepts `:timestamp` or `:reverse_timestamp`.
 
-When a Common Crawl `cluster.idx` file is next to `cdx-*.gz` shards, `rbcdx`
-uses it automatically to avoid scanning unrelated CDX blocks for URL-pattern
-queries.
+When a Common Crawl `cluster.idx` file is in the directory with `cdx-*.gz`
+shards, `rbcdx` uses it automatically to avoid scanning unrelated CDX blocks
+for URL-pattern queries.
 
 ## What rbcdx Does Not Do
 
