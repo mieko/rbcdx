@@ -794,6 +794,212 @@ class IndexTest < Minitest::Test
     end
   end
 
+  def test_rbcdx_collapse_urlkey_keeps_latest_capture
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "collapsed.rbcdx", collapsed_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      captures = index.captures("collapsed.example/*", collapse: :urlkey).to_a
+
+      assert_equal [
+        "https://collapsed.example/a",
+        "https://collapsed.example/b"
+      ], captures.map(&:url)
+      assert_equal %w[20250103000000 20250104000000], captures.map(&:timestamp)
+    end
+  end
+
+  def test_rbcdx_collapse_urlkey_is_global_across_adjacent_files
+    Dir.mktmpdir do |dir|
+      repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        example,collapsed)/repeat 20250101000000 {"url":"https://collapsed.example/repeat","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        example,collapsed)/repeat 20250105000000 {"url":"https://collapsed.example/repeat","mime":"text/html","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+        example,collapsed)/second 20250102000000 {"url":"https://collapsed.example/second","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(dir)
+
+      captures = index.captures("collapsed.example/*", collapse: :urlkey).to_a
+
+      assert_equal [
+        "https://collapsed.example/repeat",
+        "https://collapsed.example/second"
+      ], captures.map(&:url)
+      assert_equal %w[20250105000000 20250102000000], captures.map(&:timestamp)
+    end
+  end
+
+  def test_rbcdx_collapse_applies_filters_before_selecting_latest
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "filtered-collapse.rbcdx", <<~CDXJ)
+        example,collapsed)/repeat 20250101000000 {"url":"https://collapsed.example/repeat","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,collapsed)/repeat 20250105000000 {"url":"https://collapsed.example/repeat","mime":"text/html","status":"404","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(path)
+
+      captures = index.captures("collapsed.example/*", filters: :status_200, collapse: :urlkey).to_a
+
+      assert_equal ["https://collapsed.example/repeat"], captures.map(&:url)
+      assert_equal ["20250101000000"], captures.map(&:timestamp)
+    end
+  end
+
+  def test_rbcdx_collapse_limit_counts_urlkey_groups
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "collapsed.rbcdx", collapsed_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      captures = index.captures("collapsed.example/*", collapse: :urlkey, limit: 1).to_a
+
+      assert_equal ["https://collapsed.example/a"], captures.map(&:url)
+      assert_equal ["20250103000000"], captures.map(&:timestamp)
+    end
+  end
+
+  def test_rbcdx_collapse_page_size_counts_urlkey_groups
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "collapsed.rbcdx", collapsed_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      first = index.captures("collapsed.example/*", collapse: :urlkey, page_size: 1)
+      second = index.captures("collapsed.example/*", collapse: :urlkey, page_size: 1, cursor: first.next_cursor)
+
+      assert_equal ["https://collapsed.example/a"], first.map(&:url)
+      assert_equal ["20250103000000"], first.map(&:timestamp)
+      assert_equal ["https://collapsed.example/b"], second.map(&:url)
+      assert_equal ["20250104000000"], second.map(&:timestamp)
+      assert_predicate second, :exhausted?
+    end
+  end
+
+  def test_rbcdx_collapse_page_keeps_group_together_across_adjacent_files
+    Dir.mktmpdir do |dir|
+      repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        example,collapsed)/repeat 20250101000000 {"url":"https://collapsed.example/repeat","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        example,collapsed)/repeat 20250105000000 {"url":"https://collapsed.example/repeat","mime":"text/html","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+        example,collapsed)/second 20250102000000 {"url":"https://collapsed.example/second","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(dir)
+
+      first = index.captures("collapsed.example/*", collapse: :urlkey, page_size: 1)
+      second = index.captures("collapsed.example/*", collapse: :urlkey, page_size: 1, cursor: first.next_cursor)
+
+      assert_equal ["https://collapsed.example/repeat"], first.map(&:url)
+      assert_equal ["20250105000000"], first.map(&:timestamp)
+      assert_equal ["https://collapsed.example/second"], second.map(&:url)
+      assert_predicate second, :exhausted?
+    end
+  end
+
+  def test_rbcdx_collapse_page_cursor_skips_nonmatching_boundary_captures
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "filtered-boundary.rbcdx", <<~CDXJ)
+        example,collapsed)/a 20250101000000 {"url":"https://collapsed.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,collapsed)/b 20250102000000 {"url":"https://collapsed.example/b","mime":"text/html","status":"404","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,collapsed)/b 20250101000000 {"url":"https://collapsed.example/b","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,collapsed)/c 20250103000000 {"url":"https://collapsed.example/c","mime":"text/html","status":"200","length":"10","offset":"4","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(path)
+
+      first = index.captures("collapsed.example/*", filters: :status_200, collapse: :urlkey, page_size: 1)
+      second = index.captures("collapsed.example/*", filters: :status_200, collapse: :urlkey, page_size: 1, cursor: first.next_cursor)
+      third = index.captures("collapsed.example/*", filters: :status_200, collapse: :urlkey, page_size: 1, cursor: second.next_cursor)
+
+      assert_equal ["https://collapsed.example/a"], first.map(&:url)
+      assert_equal ["https://collapsed.example/b"], second.map(&:url)
+      assert_equal ["20250101000000"], second.map(&:timestamp)
+      assert_equal ["https://collapsed.example/c"], third.map(&:url)
+      assert_predicate third, :exhausted?
+    end
+  end
+
+  def test_rbcdx_collapse_cursor_rejects_uncollapsed_resume
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "collapsed.rbcdx", collapsed_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      first = index.captures("collapsed.example/*", collapse: :urlkey, page_size: 1)
+
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("collapsed.example/*", page_size: 1, cursor: first.next_cursor)
+      end
+    end
+  end
+
+  def test_rbcdx_collapse_rejects_sort_and_closest
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "collapsed.rbcdx", collapsed_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      assert_raises(CDX::UnsupportedCollapse) do
+        index.captures("collapsed.example/*", collapse: :urlkey, sort: :timestamp).to_a
+      end
+      assert_raises(CDX::UnsupportedCollapse) do
+        index.captures("collapsed.example/*", collapse: :urlkey, closest: "202501").to_a
+      end
+    end
+  end
+
+  def test_rbcdx_collapse_order_validation
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "collapsed.rbcdx", collapsed_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      assert_raises(ArgumentError) do
+        index.captures("collapsed.example/*", collapse_order: :latest).to_a
+      end
+      assert_raises(ArgumentError) do
+        index.captures("collapsed.example/*", collapse: :urlkey, collapse_order: :earliest).to_a
+      end
+      assert_raises(ArgumentError) do
+        index.captures("collapsed.example/*", collapse: :urlkey, collapse_order: :earliest, page_size: 1)
+      end
+    end
+  end
+
+  def test_cdxj_query_collapse_is_unsupported
+    error = assert_raises(CDX::UnsupportedCollapse) do
+      @index.captures("commoncrawl.org/*", collapse: :urlkey).to_a
+    end
+
+    assert_match(/only supported for \.rbcdx indexes/, error.message)
+  end
+
+  def test_rbcdx_collapse_rejects_unsafe_multi_file_ranges
+    Dir.mktmpdir do |dir|
+      repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        example,collapsed)/z 20250101000000 {"url":"https://collapsed.example/z","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        example,collapsed)/a 20250101000000 {"url":"https://collapsed.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(dir)
+
+      error = assert_raises(CDX::UnsupportedCollapse) do
+        index.captures("collapsed.example/*", collapse: :urlkey).to_a
+      end
+
+      assert_match(/globally urlkey-grouped/, error.message)
+    end
+  end
+
+  def test_rbcdx_collapse_ignores_nonoverlapping_files_when_validating_ranges
+    Dir.mktmpdir do |dir|
+      repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        com,zeta)/ 20250101000000 {"url":"https://zeta.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        com,alpha)/ 20250101000000 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(dir)
+
+      assert_equal ["https://alpha.com/"], index.captures("alpha.com/*", collapse: :urlkey).map(&:url)
+    end
+  end
+
   def test_capture_page_rejects_malformed_and_mismatched_cursors
     Dir.mktmpdir do |dir|
       path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
@@ -1084,6 +1290,15 @@ class IndexTest < Minitest::Test
       offset = index.to_s
       "example,paged)/#{path} #{timestamp} {\"url\":\"https://paged.example/#{path}\",\"mime\":\"text/html\",\"status\":\"200\",\"length\":\"10\",\"offset\":\"#{offset}\",\"filename\":\"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz\"}\n"
     end.join
+  end
+
+  def collapsed_repackable_cdxj
+    <<~CDXJ
+      example,collapsed)/a 20250101000000 {"url":"https://collapsed.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapsed)/a 20250103000000 {"url":"https://collapsed.example/a","mime":"text/html","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapsed)/b 20250102000000 {"url":"https://collapsed.example/b","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapsed)/b 20250104000000 {"url":"https://collapsed.example/b","mime":"text/html","status":"200","length":"10","offset":"4","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
   end
 
   def mutate_cursor(cursor)

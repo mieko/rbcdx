@@ -91,6 +91,27 @@ class RepackerTest < Minitest::Test
     end
   end
 
+  def test_repack_collapse_urlkey_writes_latest_per_urlkey_and_metadata
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "collapse.cdxj")
+      output = File.join(dir, "collapse.rbcdx")
+      File.write(input, collapse_repack_cdxj)
+
+      result = CDX::Repacker.repack(input, output, collapse: :urlkey)
+
+      assert_equal 2, result.record_count
+      assert_equal [
+        "https://collapse.example/a",
+        "https://collapse.example/b"
+      ], CDX::Index.open(output).map(&:url)
+      assert_equal %w[20250103000000 20250104000000], CDX::Index.open(output).map(&:timestamp)
+      assert_equal(
+        {"field" => "urlkey", "order" => "latest"},
+        CDX::Repacker.read_header(output).fetch("repack").fetch("collapse_signature")
+      )
+    end
+  end
+
   def test_repack_reads_gzip_input
     Dir.mktmpdir do |dir|
       input = File.join(dir, "cdx-00000.gz")
@@ -395,8 +416,23 @@ class RepackerTest < Minitest::Test
 
       assert_equal 0, status
       assert_match(/would create \[1\/1\] #{Regexp.escape(output)} from #{Regexp.escape(input)}/, out.string)
-      assert_match(/filtered \[1\/1\] #{Regexp.escape(input)}: 2 of 3 records passed filters/, out.string)
+      assert_match(/filtered \[1\/1\] #{Regexp.escape(input)}: 2 of 3 records selected/, out.string)
       assert_empty err.string
+      refute File.exist?(output)
+    end
+  end
+
+  def test_cli_repack_dry_run_with_collapse_reports_selected_records
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "collapse.cdxj")
+      output = File.join(dir, "collapse.rbcdx")
+      File.write(input, collapse_repack_cdxj)
+      out = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output", output, "--collapse", "urlkey", "--dry-run", input], out: out, err: StringIO.new)
+
+      assert_equal 0, status
+      assert_match(/filtered \[1\/1\] #{Regexp.escape(input)}: 2 of 4 records selected/, out.string)
       refute File.exist?(output)
     end
   end
@@ -617,6 +653,25 @@ class RepackerTest < Minitest::Test
     end
   end
 
+  def test_cli_repack_accepts_collapse_urlkey
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "collapse.cdxj")
+      output = File.join(dir, "collapse.rbcdx")
+      File.write(input, collapse_repack_cdxj)
+      out = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output", output, "--collapse", "urlkey", input], out: out, err: StringIO.new)
+
+      assert_equal 0, status
+      assert_equal "#{output}\n", out.string
+      assert_equal %w[20250103000000 20250104000000], CDX::Index.open(output).map(&:timestamp)
+      assert_equal(
+        {"field" => "urlkey", "order" => "latest"},
+        CDX::Repacker.read_header(output).fetch("repack").fetch("collapse_signature")
+      )
+    end
+  end
+
   def test_repack_many_writes_outputs_state_manifest_and_progress
     Dir.mktmpdir do |dir|
       input_dir = File.join(dir, "cdx")
@@ -643,6 +698,153 @@ class RepackerTest < Minitest::Test
       assert_includes events.map(&:first), :state_finish
       assert_includes events.map(&:first), :start
       assert_includes events.map(&:first), :finish
+    end
+  end
+
+  def test_repack_many_collapse_urlkey_selects_globally_across_inputs
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      first = File.join(input_dir, "cdx-00000.cdxj")
+      second = File.join(input_dir, "cdx-00001.cdxj")
+      File.write(first, collapse_batch_first_cdxj)
+      File.write(second, collapse_batch_second_cdxj)
+
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey)
+
+      assert_equal [:written, :written], results.map(&:status)
+      index = CDX::Index.open(output_dir)
+      assert_equal [
+        "https://batch-collapse.example/a",
+        "https://batch-collapse.example/b"
+      ], index.captures("batch-collapse.example/*").map(&:url)
+      assert_equal ["20250105000000"], index.captures("batch-collapse.example/a").map(&:timestamp)
+      assert_equal 0, CDX::Index.open(File.join(output_dir, "cdx-00000.rbcdx")).count
+      assert File.file?(File.join(output_dir, CDX::BatchRepacker::SELECTION_DIRNAME, "00000-cdx-00000.rbcdx.lines"))
+      assert File.file?(File.join(output_dir, CDX::BatchRepacker::SELECTION_DIRNAME, "00001-cdx-00001.rbcdx.lines"))
+      header = CDX::Repacker.read_header(File.join(output_dir, "cdx-00001.rbcdx"))
+      assert_equal(
+        {"field" => "urlkey", "order" => "latest"},
+        header.fetch("repack").fetch("collapse_signature")
+      )
+      state = JSON.parse(File.read(File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)))
+      assert_equal(
+        {"field" => "urlkey", "order" => "latest"},
+        state.fetch("plan").fetch("collapse_signature")
+      )
+      assert state.fetch("entries").all? { |entry| entry.fetch("selection_path").end_with?(".lines") }
+    end
+  end
+
+  def test_repack_many_collapse_rejects_inputs_that_are_not_globally_grouped
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      File.write(File.join(input_dir, "cdx-00000.cdxj"), collapse_ungrouped_first_cdxj)
+      File.write(File.join(input_dir, "cdx-00001.cdxj"), collapse_ungrouped_second_cdxj)
+
+      error = assert_raises(CDX::UnsupportedCollapse) do
+        CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey)
+      end
+
+      assert_match(/globally urlkey-grouped input files/, error.message)
+      refute File.exist?(File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME))
+    end
+  end
+
+  def test_repack_many_collapse_resume_uses_persisted_selection_after_delete
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      first = File.join(input_dir, "cdx-00000.cdxj")
+      second = File.join(input_dir, "cdx-00001.cdxj")
+      File.write(first, collapse_batch_first_cdxj)
+      File.write(second, collapse_batch_second_cdxj)
+
+      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey, delete_when_processed: true)
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey, resume: true, delete_when_processed: true)
+
+      assert_equal [:skipped, :skipped], results.map(&:status)
+      refute File.exist?(first)
+      refute File.exist?(second)
+      assert_equal ["20250105000000"], CDX::Index.open(output_dir).captures("batch-collapse.example/a").map(&:timestamp)
+    end
+  end
+
+  def test_repack_many_collapse_resume_rejects_output_with_wrong_selected_fingerprint
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      first = File.join(input_dir, "cdx-00000.cdxj")
+      second = File.join(input_dir, "cdx-00001.cdxj")
+      File.write(first, collapse_batch_first_cdxj)
+      File.write(second, collapse_batch_second_cdxj)
+      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey)
+      stale_output = File.join(output_dir, "cdx-00000.rbcdx")
+      CDX::Repacker.repack(first, stale_output, collapse: :urlkey, force: true)
+
+      error = assert_raises(CDX::Error) do
+        CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey, resume: true, delete_when_processed: true)
+      end
+
+      assert_match(/output already exists and does not match/, error.message)
+      assert File.exist?(first)
+      assert File.exist?(second)
+    end
+  end
+
+  def test_repack_many_collapse_resume_rejects_corrupted_selection_sidecar
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      File.write(File.join(input_dir, "cdx-00000.cdxj"), collapse_batch_first_cdxj)
+      File.write(File.join(input_dir, "cdx-00001.cdxj"), collapse_batch_second_cdxj)
+      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey)
+      state = JSON.parse(File.read(File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)))
+      second_entry = state.fetch("entries").last
+      File.write(second_entry.fetch("selection_path"), "2\n")
+      File.delete(second_entry.fetch("output_path"))
+
+      error = assert_raises(CDX::Error) do
+        CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey, resume: true)
+      end
+
+      assert_match(/collapse selection sidecar does not match this repack plan/, error.message)
+      refute File.exist?(second_entry.fetch("output_path"))
+    end
+  end
+
+  def test_repack_many_collapse_resume_recovers_output_published_before_state_result
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "cdx")
+      output_dir = File.join(dir, "rbcdx")
+      FileUtils.mkdir_p(input_dir)
+      first = File.join(input_dir, "cdx-00000.cdxj")
+      second = File.join(input_dir, "cdx-00001.cdxj")
+      File.write(first, collapse_batch_first_cdxj)
+      File.write(second, collapse_batch_second_cdxj)
+      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey)
+      state_path = File.join(output_dir, CDX::BatchRepacker::STATE_FILENAME)
+      state = JSON.parse(File.read(state_path))
+      interrupted = state.fetch("entries").first
+      interrupted["status"] = "processing"
+      interrupted.delete("output_signature")
+      interrupted.delete("record_count")
+      interrupted.delete("selected_fingerprint")
+      File.write(state_path, "#{JSON.pretty_generate(state)}\n")
+
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir, collapse: :urlkey, resume: true)
+
+      assert_equal [:skipped, :skipped], results.map(&:status)
+      recovered = JSON.parse(File.read(state_path)).fetch("entries").first
+      assert_equal "complete", recovered.fetch("status")
+      assert recovered.fetch("selected_fingerprint").is_a?(Hash)
+      assert_equal 0, recovered.fetch("selected_fingerprint").fetch("count")
     end
   end
 
@@ -1078,7 +1280,7 @@ class RepackerTest < Minitest::Test
 
       assert_equal 0, status
       assert_match(/would create \[1\/1\].*sample\.rbcdx from .*sample\.cdxj/, out.string)
-      assert_match(/filtered \[1\/1\].*sample\.cdxj: 3 of 3 records passed filters/, out.string)
+      assert_match(/filtered \[1\/1\].*sample\.cdxj: 3 of 3 records selected/, out.string)
       assert_empty err.string
       refute Dir.exist?(output_dir)
     end
@@ -1096,7 +1298,7 @@ class RepackerTest < Minitest::Test
       assert_equal 0, status
       assert_match(/would create \[1\/1\].*sample\.rbcdx from .*sample\.cdxj/, out.string)
       assert_match(/would delete after written output \[1\/1\] #{Regexp.escape(input)}/, out.string)
-      assert_match(/filtered \[1\/1\].*sample\.cdxj: 3 of 3 records passed filters/, out.string)
+      assert_match(/filtered \[1\/1\].*sample\.cdxj: 3 of 3 records selected/, out.string)
       assert_empty err.string
       assert File.exist?(input)
       refute File.exist?(File.join(dir, "sample.rbcdx"))
@@ -1391,6 +1593,33 @@ class RepackerTest < Minitest::Test
       assert_match(/creating repack state/, err.string)
       assert_match(/processing \[1\/1\]/, err.string)
       assert File.file?(File.join(output_dir, "sample.rbcdx"))
+      refute File.exist?(log_path)
+    ensure
+      Dir.chdir(previous) if previous
+    end
+  end
+
+  def test_cli_repack_resume_clears_collapse_when_request_log_omits_it
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "duplicates.cdxj")
+      output_dir = File.join(dir, "packed")
+      log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
+      File.write(input, duplicate_urlkey_cdxj)
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir)
+      out = StringIO.new
+      err = StringIO.new
+      previous = Dir.pwd
+
+      Dir.chdir(dir) do
+        status = CDX::CLI.start(["repack", "--resume", "--collapse", "urlkey"], out: out, err: err)
+
+        assert_equal 0, status
+      end
+
+      output = File.join(output_dir, "duplicates.rbcdx")
+      assert_equal "#{output}\n", out.string
+      assert_equal 3, CDX::Index.open(output).captures("example.com/repeat").count
+      assert_includes err.string, "resuming from #{File.join(File.realpath(dir), CDX::CLI::REPACK_LOG_FILENAME)}"
       refute File.exist?(log_path)
     ensure
       Dir.chdir(previous) if previous
@@ -1766,6 +1995,36 @@ class RepackerTest < Minitest::Test
     end
   end
 
+  def test_repack_many_cdxj_rejects_source_changed_before_write_and_does_not_delete
+    Dir.mktmpdir do |dir|
+      input_dir = File.join(dir, "source")
+      output_dir = File.join(dir, "out")
+      FileUtils.mkdir_p(input_dir)
+      input = File.join(input_dir, "sample.cdxj")
+      File.write(input, sorted_cdxj)
+      changed = false
+
+      error = assert_raises(CDX::Error) do
+        CDX::Repacker.repack_many(
+          [input],
+          output_dir: output_dir,
+          output_format: "cdxj",
+          delete_when_processed: true,
+          progress: lambda do |event, **_payload|
+            next unless event == :state_finish
+            next if changed
+
+            changed = true
+            File.write(input, duplicate_urlkey_cdxj)
+          end
+        )
+      end
+
+      assert_match(/source changed before output was written/, error.message)
+      assert File.exist?(input)
+    end
+  end
+
   def test_repack_many_cdxj_resume_ignores_same_directory_output
     Dir.mktmpdir do |dir|
       input = File.join(dir, "sample.cdxj")
@@ -1946,6 +2205,42 @@ class RepackerTest < Minitest::Test
       com,example)/repeat 20240101010101 {"url":"https://example.com/repeat","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
       com,example)/repeat 20240202020202 {"url":"https://example.com/repeat","mime":"text/html","status":"200","length":"20","offset":"11","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
       com,example)/repeat 20240303030303 {"url":"https://example.com/repeat","mime":"text/html","status":"200","length":"30","offset":"31","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def collapse_repack_cdxj
+    <<~CDXJ
+      example,collapse)/a 20250101000000 {"url":"https://collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapse)/a 20250103000000 {"url":"https://collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapse)/b 20250102000000 {"url":"https://collapse.example/b","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapse)/b 20250104000000 {"url":"https://collapse.example/b","mime":"text/html","status":"200","length":"10","offset":"4","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def collapse_batch_first_cdxj
+    <<~CDXJ
+      example,batch-collapse)/a 20250101000000 {"url":"https://batch-collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def collapse_batch_second_cdxj
+    <<~CDXJ
+      example,batch-collapse)/a 20250105000000 {"url":"https://batch-collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+      example,batch-collapse)/b 20250103000000 {"url":"https://batch-collapse.example/b","mime":"text/html","status":"200","length":"10","offset":"4","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+    CDXJ
+  end
+
+  def collapse_ungrouped_first_cdxj
+    <<~CDXJ
+      example,batch-collapse)/a 20250101000000 {"url":"https://batch-collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,batch-collapse)/b 20250102000000 {"url":"https://batch-collapse.example/b","mime":"text/html","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def collapse_ungrouped_second_cdxj
+    <<~CDXJ
+      example,batch-collapse)/a 20250105000000 {"url":"https://batch-collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
+      example,batch-collapse)/c 20250103000000 {"url":"https://batch-collapse.example/c","mime":"text/html","status":"200","length":"10","offset":"4","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00002.warc.gz"}
     CDXJ
   end
 

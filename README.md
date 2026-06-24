@@ -139,6 +139,26 @@ keeps normal WARC-backed `200` captures whose MIME type looks text-extractable,
 while dropping obvious assets and site metadata. `sort:` accepts `:timestamp` or
 `:reverse_timestamp`.
 
+Packed `.rbcdx` queries can collapse repeated captures of the same CDX URL key:
+
+```ruby
+index.captures(
+  "dailyadvance.com/news/local/*",
+  match: :prefix,
+  filters: :extractable_text,
+  collapse: :urlkey
+)
+```
+
+`collapse: :urlkey` runs after match, timestamp, and filter selection, and keeps
+the latest matching CDX timestamp for each URL key. `limit:` and `page_size:`
+count collapsed URL-key groups, not raw captures. Query collapse is currently
+for packed `.rbcdx` indexes only; rbcdx raises `CDX::UnsupportedCollapse` rather
+than doing per-file collapse if it cannot prove the logical input is globally
+URL-key grouped. That proof uses `.rbcdx` file URL-key ranges before scanning
+captures, so a raw multi-file layout with overlapping or out-of-order ranges may
+be rejected even when later filters would exclude the offending records.
+
 When a Common Crawl `cluster.idx` file is in the directory with `cdx-*.gz`
 shards, rbcdx uses it automatically to avoid scanning unrelated CDXJ blocks for
 URL-pattern queries.
@@ -216,6 +236,10 @@ participate automatically in cursor query signatures with their canonical
 underscore names; for example `filters: [:status_200, :warc]` is signed as
 `["status_200", "warc"]`. For more query filter details, see
 [Querying](doc/query.md).
+
+Cursor pages also support `collapse: :urlkey`. A page boundary is placed between
+URL-key groups, so resuming a collapsed query does not skip a later capture that
+could have won its group.
 
 ## Capture Objects
 
@@ -360,6 +384,19 @@ rbcdx repack --output-dir ./rbcdx-indexes ./indexes/CC-MAIN-2026-25
 
 Non-dry-run repacks write progress and resume instructions to stderr. Successful
 output paths are written to stdout, one per line, so scripts can consume them.
+
+When you only need one representative capture per URL key, repack can write a
+smaller derived index:
+
+```sh
+rbcdx repack --output-dir ./rbcdx-latest --filter extractable_text --collapse urlkey ./indexes/CC-MAIN-2026-25
+```
+
+Batch repack collapse is global across the logical input batch, not per shard.
+The filtered logical input stream must be globally grouped by URL key; rbcdx
+raises `CDX::UnsupportedCollapse` rather than doing per-file collapse if it sees
+URL keys move backwards across inputs. The derived index intentionally omits
+older same-URL-key captures.
 
 `CDX::Index` treats a local index directory as one backend format at a time, so
 a directory containing both `cdx-*.gz` and `.rbcdx` files should be treated as a

@@ -82,6 +82,58 @@ class CliTest < Minitest::Test
     assert_equal "4\n", out.string
   end
 
+  def test_captures_collapse_urlkey_outputs_latest_rbcdx_group
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "collapse.cdxj")
+      output = File.join(dir, "collapse.rbcdx")
+      File.write(input, collapse_cdxj)
+      CDX::Repacker.repack(input, output)
+      out = StringIO.new
+
+      status = CDX::CLI.start(
+        ["captures", "--index", output, "--collapse", "urlkey", "collapse.example/*"],
+        out: out,
+        err: StringIO.new
+      )
+
+      assert_equal 0, status
+      lines = out.string.lines.map { |line| JSON.parse(line) }
+      assert_equal ["https://collapse.example/a"], lines.map { |line| line.fetch("url") }
+      assert_equal ["20250103000000"], lines.map { |line| line.fetch("timestamp") }
+    end
+  end
+
+  def test_count_collapse_urlkey_counts_groups
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "collapse.cdxj")
+      output = File.join(dir, "collapse.rbcdx")
+      File.write(input, collapse_cdxj)
+      CDX::Repacker.repack(input, output)
+      out = StringIO.new
+
+      status = CDX::CLI.start(
+        ["count", "--index", output, "--collapse", "urlkey", "collapse.example/*"],
+        out: out,
+        err: StringIO.new
+      )
+
+      assert_equal 0, status
+      assert_equal "1\n", out.string
+    end
+  end
+
+  def test_invalid_collapse_option_returns_error
+    err = StringIO.new
+    status = CDX::CLI.start(
+      ["count", "--index", fixture_path("sample.cdxj"), "--collapse", "digest", "commoncrawl.org/*"],
+      out: StringIO.new,
+      err: err
+    )
+
+    assert_equal 1, status
+    assert_match(/unsupported collapse/, err.string)
+  end
+
   def test_match_option
     out = StringIO.new
     status = CDX::CLI.start(
@@ -314,6 +366,15 @@ class CliTest < Minitest::Test
     assert_equal 0, status
     assert_match(/--format text\|jsonl/, out.string)
     assert_empty err.string
+  end
+
+  private
+
+  def collapse_cdxj
+    <<~CDXJ
+      example,collapse)/a 20250101000000 {"url":"https://collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,collapse)/a 20250103000000 {"url":"https://collapse.example/a","mime":"text/html","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
   end
 
   class FakeDataClient

@@ -60,9 +60,12 @@ rbcdx repack --filter extractable_text --dry-run
 
 Dry runs print the output file each input would create. With
 `--delete-when-processed`, they also print the source file that would be deleted
-after the output is written. They stream each input once to report filter
-selectivity, for example `2 of 3 records passed filters`, but they do not sort,
-compress, write packed files, update state, or delete sources.
+after the output is written. Without collapse, dry runs stream each input once
+to report filter selection, for example `2 of 3 records selected`, but they do
+not sort, compress, write packed files, update state, or delete sources. With
+batch collapse enabled, rbcdx first scans the logical input batch to select the
+global URL-key winners, then previews each input against that selection; the
+selected count is after filters and collapse.
 
 Batch repack writes a resume log in the directory where you ran the command, so
 interrupted work can continue without repeating the original arguments:
@@ -112,6 +115,31 @@ Use `--where` for normal CDX field filters:
 ```sh
 rbcdx repack --output-dir ./rbcdx-200 --where '=status:200' ./indexes/CC-MAIN-2026-25
 ```
+
+## URL-Key Collapse
+
+Use `--collapse urlkey` when you only need the newest matching capture for each
+publisher URL key:
+
+```sh
+rbcdx repack --output-dir ./rbcdx-latest --filter extractable_text --collapse urlkey ./indexes/CC-MAIN-2026-25
+```
+
+Collapse runs after repack filters. For each URL-key group, rbcdx keeps the
+highest CDX timestamp; `--collapse-order latest` is the default and the only
+supported order in this version. The derived output intentionally discards the
+other same-URL-key captures, so they cannot be queried from that output later.
+
+Single-file repack streams a sorted input normally. Batch repack performs one
+global selection across the logical batch before writing per-shard outputs, so
+duplicate URL keys at adjacent file boundaries still produce one winner. Batch
+collapse requires the filtered logical input stream to be globally grouped by
+URL key; rbcdx raises `CDX::UnsupportedCollapse` instead of doing per-file
+collapse when it sees URL keys move backwards across inputs.
+
+Selection sidecars are stored under the output directory and referenced from
+`rbcdx-repack-state.json`; this lets `--resume` and `--delete-when-processed`
+continue without rereading deleted sources.
 
 ## Other Outputs
 

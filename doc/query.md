@@ -102,6 +102,44 @@ rbcdx captures --filter 'html,~url:get-started' 'example.com/*'
 `rbcdx repack --filter` always parses named filter expressions. Use
 `rbcdx repack --where` for CDX field filters during repack.
 
+## URL-Key Collapse
+
+Packed `.rbcdx` queries can return one representative capture per CDX URL key:
+
+```ruby
+index.captures(
+  "dailyadvance.com/news/local/*",
+  match: :prefix,
+  filters: :extractable_text,
+  collapse: :urlkey
+)
+```
+
+`collapse: :urlkey` groups by the URL key in the current logical index and
+keeps the highest CDX timestamp in each group. `collapse_order:` defaults to
+`:latest`; `:latest` is the only supported order in this version. Collapse runs
+after URL matching, timestamp bounds, and filters, so if the newest raw capture
+does not pass the filters, an older matching capture can win.
+
+Native output order remains URL-key/index order, not global timestamp order.
+`limit:` counts collapsed groups. Query collapse is not supported with `sort:`
+or `closest:`.
+
+Query-time collapse currently requires `.rbcdx` input. For multi-file `.rbcdx`
+queries, rbcdx validates that the selected files are globally grouped by URL
+key, allowing the same URL key at an adjacent file boundary. If rbcdx cannot
+prove that grouping, it raises `CDX::UnsupportedCollapse` instead of collapsing
+per physical file. This proof uses `.rbcdx` file URL-key ranges before scanning
+captures, so a raw multi-file layout with overlapping or out-of-order ranges may
+be rejected even when later filters would exclude the offending records.
+
+The CLI exposes the same option:
+
+```sh
+rbcdx captures --index ./rbcdx-indexes --filter extractable_text --collapse urlkey 'example.com/news/*'
+rbcdx count --index ./rbcdx-indexes --collapse urlkey 'example.com/news/*'
+```
+
 ## Cursor Pages
 
 Pass `page_size:` to `captures` for resumable page mode over packed `.rbcdx`
@@ -112,10 +150,15 @@ page = index.captures(
   "dailyadvance.com/news/local/*",
   match: :prefix,
   filters: :extractable_text,
+  collapse: :urlkey,
   page_size: 500,
   cursor: saved_cursor
 )
 ```
+
+With `collapse: :urlkey`, `page_size:` counts URL-key groups rather than raw
+captures. Page cursors resume at group boundaries, so a page will not split a
+URL-key group and lose the capture that should represent it.
 
 Cursor query signatures use canonical underscore names for named filters. For
 example, `filters: [:status_200, :warc]` signs the named-filter portion as:
