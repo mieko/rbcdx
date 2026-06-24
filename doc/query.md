@@ -4,6 +4,21 @@
 returns `CDX::Capture` records. Query filters can be CDX field filters or shared
 named capture filters.
 
+## Thread Safety
+
+Open one `CDX::Index` per worker thread or process by default. rbcdx reads index
+files without modifying them, but the `CDX::Index` object keeps lazy reader and
+lookup caches, and callers can provide custom parser or filter objects.
+Per-worker indexes keep that state local while still letting each query open its
+own file handles.
+
+Do not share one index across workers unless you serialize all access to it with
+a mutex. If you do serialize a shared index, use it only for read-only queries
+against stable index files and thread-safe caller-provided parser/filter state.
+Never have multiple workers consume the same Enumerator returned by `captures`;
+start a separate query in each worker, or distribute materialized `.rbcdx`
+cursor pages. Reopen the index when files are added, replaced, or removed.
+
 ## Ruby Filters
 
 Use CDX field-filter strings when matching index fields directly:

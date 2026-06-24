@@ -143,6 +143,35 @@ When a Common Crawl `cluster.idx` file is in the directory with `cdx-*.gz`
 shards, rbcdx uses it automatically to avoid scanning unrelated CDXJ blocks for
 URL-pattern queries.
 
+## Thread Safety
+
+Prefer opening one `CDX::Index` per worker thread or process:
+
+```ruby
+url_batches.map do |urls|
+  Thread.new do
+    index = CDX::Index.open(crawl_dir)
+    urls.each do |url|
+      index.captures(url, limit: 10).each { |capture| process(capture) }
+    end
+  end
+end.each(&:join)
+```
+
+rbcdx reads index files without modifying them, and independent queries do not
+share file handles. The `CDX::Index` object itself still owns lazy reader and
+lookup caches. Opening one index per worker keeps that state local, avoids
+sharing custom parser or filter state, and works the same way on Ruby
+implementations with different threading behavior.
+
+Do not share one `CDX::Index` across workers unless you serialize all access to
+it with a mutex. If you do serialize a shared index, use it only for read-only
+queries against index files that are not being modified. Do not have multiple
+workers consume the same Enumerator returned by `captures`; create a separate
+query, or use `.rbcdx` cursor pages as the unit of work. Reopen the index when
+you want to see newly written, replaced, or removed index files, because paths
+and metadata are captured when the index is opened.
+
 ## Cursor Pages
 
 For durable, bounded work queues over packed `.rbcdx` indexes, pass
