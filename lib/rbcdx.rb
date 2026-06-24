@@ -3,9 +3,13 @@ require_relative "rbcdx/version"
 module CDX
   Error = Class.new(StandardError)
   ParseError = Class.new(Error)
+  InvalidCursor = Class.new(ArgumentError)
+  UnsupportedPageQuery = Class.new(ArgumentError)
 end
 
 require_relative "rbcdx/capture"
+require_relative "rbcdx/capture_cursor"
+require_relative "rbcdx/capture_page"
 require_relative "rbcdx/common_crawl_data"
 require_relative "rbcdx/filter"
 require_relative "rbcdx/repack_filters"

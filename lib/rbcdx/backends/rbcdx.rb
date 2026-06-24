@@ -2,6 +2,7 @@ module CDX
   module Backends
     class RbCDX
       INDEX_FILE_PATTERN = /\.rbcdx[0-9A-Za-z]*\z/
+      CAPTURE_PAGE_CURSOR_VERSION = 1
 
       attr_reader :paths
 
@@ -34,7 +35,90 @@ module CDX
         end
       end
 
+      def capture_pages_supported?
+        true
+      end
+
+      def capture_page_backend
+        "rbcdx"
+      end
+
+      def capture_page_cursor_version
+        CAPTURE_PAGE_CURSOR_VERSION
+      end
+
+      def capture_page_fingerprint
+        {
+          "backend" => capture_page_backend,
+          "cursor_version" => capture_page_cursor_version,
+          "paths" => paths.map { |path| Repack.file_signature(path) },
+          "manifests" => @manifests.map { |manifest| Repack.file_signature(manifest.manifest_path) if manifest.manifest_path }.compact
+        }
+      end
+
+      def each_page_candidate(matcher:, position: nil)
+        return enum_for(:each_page_candidate, matcher: matcher, position: position) unless block_given?
+
+        resuming = !position.nil?
+        specs = matcher ? query_specs(matcher) : [[nil, false]]
+        cursor = normalize_cursor_position(position, specs.length)
+        manifest_by_path = matcher ? manifests_by_path : {}
+        candidates = matcher ? manifest_candidate_paths(specs) : {}
+
+        paths.each_with_index do |path, path_index|
+          next if path_index < cursor.fetch("path_index")
+          next if matcher && @manifests.any? && manifest_by_path.key?(path) && !candidates.include?(path)
+
+          specs.each_with_index do |(urlkey, prefix), spec_index|
+            next if path_index == cursor.fetch("path_index") && spec_index < cursor.fetch("spec_index")
+
+            at_cursor = resuming && path_index == cursor.fetch("path_index") && spec_index == cursor.fetch("spec_index")
+            start_block = at_cursor ? cursor.fetch("block_index") : nil
+            start_record = at_cursor ? cursor.fetch("record_index") : nil
+
+            reader = reader_for(path)
+            iterator = if matcher
+              reader.captures_with_positions(urlkey, prefix: prefix, block_index: start_block, record_index: start_record)
+            else
+              reader.each_capture_with_positions(block_index: start_block, record_index: start_record)
+            end
+
+            iterator.each do |capture, reader_position|
+              yield capture, {
+                "path_index" => path_index,
+                "spec_index" => spec_index,
+                "block_index" => reader_position.fetch("block_index"),
+                "record_index" => reader_position.fetch("record_index")
+              }
+            end
+          end
+        end
+      end
+
       private
+
+      def normalize_cursor_position(position, spec_count)
+        return {"path_index" => 0, "spec_index" => 0, "block_index" => 0, "record_index" => 0} unless position
+        raise InvalidCursor, "malformed capture cursor position" unless position.is_a?(Hash)
+
+        cursor = %w[path_index spec_index block_index record_index].to_h do |key|
+          [key, cursor_position_integer(position, key)]
+        end
+
+        raise InvalidCursor, "capture cursor position is outside this index" unless cursor.fetch("path_index") < paths.length
+        raise InvalidCursor, "capture cursor position is outside this query" unless cursor.fetch("spec_index") < spec_count
+
+        cursor
+      end
+
+      def cursor_position_integer(position, key)
+        value = position.fetch(key)
+        raise InvalidCursor, "malformed capture cursor position" unless value.is_a?(Integer) && value >= 0
+
+        value
+      rescue KeyError
+        raise InvalidCursor, "malformed capture cursor position"
+      end
 
       def each_capture_with_manifests(matcher)
         specs = query_specs(matcher)

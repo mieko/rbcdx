@@ -31,5 +31,6 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "csv", "~> 3.0"
+  spec.add_dependency "base64", "~> 0.3"
   spec.add_dependency "zstd-ruby", "~> 1.5"
 end

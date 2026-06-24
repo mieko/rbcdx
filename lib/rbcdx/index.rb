@@ -6,6 +6,7 @@ module CDX
       Backends::CDXJ,
       Backends::RbCDX
     ].freeze
+    CURSOR_UNSET = Object.new.freeze
 
     attr_reader :paths
 
@@ -32,7 +33,32 @@ module CDX
     end
 
     def captures(url = nil, limit: nil, from: nil, to: nil, filters: nil, fields: nil,
-      closest: nil, match: nil, sort: nil, &block)
+      closest: nil, match: nil, sort: nil, page_size: nil, cursor: CURSOR_UNSET,
+      filter_signature: nil, &block)
+      unless page_size.nil?
+        page = run_page_query(
+          url: url,
+          limit: limit,
+          from: from,
+          to: to,
+          filters: filters,
+          fields: fields,
+          closest: closest,
+          match: match,
+          sort: sort,
+          page_size: page_size,
+          cursor: cursor,
+          filter_signature: filter_signature
+        )
+        return page unless block
+
+        page.each(&block)
+        return page
+      end
+
+      raise ArgumentError, "cursor requires page_size" unless cursor.equal?(CURSOR_UNSET)
+      raise ArgumentError, "filter_signature requires page_size" unless filter_signature.nil?
+
       enum = Enumerator.new do |yielder|
         run_query(
           yielder,
@@ -55,6 +81,47 @@ module CDX
     end
 
     private
+
+    def run_page_query(url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:, page_size:, cursor:, filter_signature:)
+      raise ArgumentError, "choose limit or page_size, not both" unless limit.nil?
+      raise UnsupportedPageQuery, "sort is not supported for cursor pages" unless sort.nil?
+      raise UnsupportedPageQuery, "closest is not supported for cursor pages" unless closest.nil?
+      raise UnsupportedPageQuery, "cursor pages are only supported for .rbcdx indexes" unless @backend.capture_pages_supported?
+
+      page_size = normalize_page_size(page_size)
+      matcher = UrlMatcher.new(url, match: match) if url
+      stable_filters = stable_filter_signature(filters, filter_signature)
+      checks = Filter.build(filter_list(filters))
+      query_digest = CaptureCursor.digest(page_query_signature(url, matcher, from, to, stable_filters))
+      index_digest = CaptureCursor.digest(@backend.capture_page_fingerprint)
+      cursor = cursor.equal?(CURSOR_UNSET) ? nil : CaptureCursor.coerce(cursor)
+      position = page_cursor_position(cursor, index_digest, query_digest)
+
+      captures = []
+      next_cursor = nil
+      @backend.each_page_candidate(matcher: matcher, position: position) do |capture, candidate_position|
+        next unless capture_matches?(capture, matcher, checks, from, to)
+
+        if captures.length < page_size
+          captures << project(capture, fields)
+        else
+          next_cursor = build_capture_cursor(index_digest, query_digest, candidate_position)
+          break
+        end
+      end
+
+      CapturePage.new(captures, next_cursor: next_cursor)
+    end
+
+    def normalize_page_size(page_size)
+      string = page_size.to_s
+      raise ArgumentError, "page_size must be a positive integer" unless string.match?(/\A\d+\z/)
+
+      value = string.to_i
+      raise ArgumentError, "page_size must be a positive integer" unless value.positive?
+
+      value
+    end
 
     def run_query(yielder, url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:)
       matcher = UrlMatcher.new(url, match: match) if url
@@ -98,6 +165,106 @@ module CDX
       else
         [filters]
       end
+    end
+
+    def stable_filter_signature(filters, filter_signature)
+      stable = []
+      unstable = false
+
+      filter_list(filters).each do |filter|
+        term = stable_filter_term(filter)
+        if term
+          stable << term
+        else
+          unstable = true
+        end
+      end
+
+      if unstable && filter_signature.nil?
+        raise UnsupportedPageQuery, "filter_signature is required for Proc or custom filters in cursor pages"
+      end
+
+      signature = {"stable" => stable}
+      signature["unstable_count"] = filter_list(filters).length - stable.length
+      signature["custom"] = CaptureCursor.canonical_value(filter_signature) unless filter_signature.nil?
+      signature
+    end
+
+    def stable_filter_term(filter)
+      case filter
+      when Filter
+        expression = stable_filter_value(filter.expression)
+        return unless expression
+
+        {"type" => "filter", "field" => filter.field, "modifier" => filter.modifier, "expression" => expression}
+      when String
+        stable_filter_term(Filter.parse(filter))
+      when Hash
+        entries = []
+        filter.each do |field, expected|
+          value = stable_filter_value(expected)
+          unless value
+            entries = nil
+            break
+          end
+
+          entries << [field.to_s, value]
+        end
+        return unless entries
+
+        {"type" => "hash", "entries" => entries.sort_by(&:first)}
+      when Proc
+        nil
+      end
+    end
+
+    def stable_filter_value(value)
+      case value
+      when Regexp
+        {"type" => "regexp", "source" => value.source, "options" => value.options}
+      when Array
+        values = value.map { |item| stable_filter_value(item) }
+        return if values.any?(&:nil?)
+
+        {"type" => "array", "values" => values}
+      when String, Symbol, Integer, Float, TrueClass, FalseClass, NilClass
+        {"type" => "value", "value" => value.to_s}
+      end
+    end
+
+    def page_query_signature(url, matcher, from, to, stable_filters)
+      {
+        "cursor_version" => CaptureCursor::VERSION,
+        "url" => url&.to_s,
+        "match" => matcher&.match&.to_s,
+        "from" => Timestamp.normalize(from),
+        "to" => Timestamp.normalize(to, high: true),
+        "filters" => stable_filters
+      }
+    end
+
+    def page_cursor_position(cursor, index_digest, query_digest)
+      return unless cursor
+
+      CaptureCursor.__send__(
+        :extract_position,
+        cursor,
+        backend: @backend.capture_page_backend,
+        backend_version: @backend.capture_page_cursor_version,
+        index_digest: index_digest,
+        query_digest: query_digest
+      )
+    end
+
+    def build_capture_cursor(index_digest, query_digest, position)
+      CaptureCursor.new(
+        "version" => CaptureCursor::VERSION,
+        "backend" => @backend.capture_page_backend,
+        "backend_version" => @backend.capture_page_cursor_version,
+        "index" => index_digest,
+        "query" => query_digest,
+        "position" => position
+      )
     end
 
     def sort_captures(captures, closest:, sort:)

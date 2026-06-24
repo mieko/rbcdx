@@ -610,6 +610,208 @@ class IndexTest < Minitest::Test
     end
   end
 
+  def test_rbcdx_capture_pages_are_materialized_and_resume_without_losing_lookahead
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      first = index.captures("paged.example/*", page_size: 2)
+
+      assert_instance_of CDX::CapturePage, first
+      assert_equal [
+        "https://paged.example/page-01",
+        "https://paged.example/page-02"
+      ], first.map(&:url)
+      assert_instance_of CDX::CaptureCursor, first.next_cursor
+      refute_predicate first, :exhausted?
+      assert_predicate first.captures, :frozen?
+
+      second = index.captures("paged.example/*", page_size: 2, cursor: first.next_cursor.to_s)
+      assert_equal [
+        "https://paged.example/page-03",
+        "https://paged.example/page-04"
+      ], second.map(&:url)
+
+      final = index.captures("paged.example/*", page_size: 2, cursor: second.next_cursor)
+      assert_equal ["https://paged.example/page-05"], final.map(&:url)
+      assert_nil final.next_cursor
+      assert_predicate final, :exhausted?
+    end
+  end
+
+  def test_rbcdx_capture_page_block_form_returns_page
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+      seen = []
+
+      page = index.captures("paged.example/*", page_size: 2) do |capture|
+        seen << capture.url
+      end
+
+      assert_instance_of CDX::CapturePage, page
+      assert_equal page.map(&:url), seen
+      assert_instance_of CDX::CaptureCursor, page.next_cursor
+    end
+  end
+
+  def test_rbcdx_capture_pages_allow_page_size_and_fields_to_change
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      first = index.captures("paged.example/*", page_size: 1, fields: %w[url])
+      second = index.captures("paged.example/*", page_size: 3, fields: %w[status], cursor: first.next_cursor)
+
+      assert_equal [{"url" => "https://paged.example/page-01"}], first.map(&:to_h)
+      assert_equal [{"status" => "200"}, {"status" => "200"}, {"status" => "200"}], second.map(&:to_h)
+    end
+  end
+
+  def test_rbcdx_capture_pages_support_domain_specs_across_pages
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "domain.rbcdx", <<~CDXJ)
+        example,paged)/ 20250101000000 {"url":"https://paged.example/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,paged,assets)/logo.png 20250101000001 {"url":"https://assets.paged.example/logo.png","mime":"image/png","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(path)
+
+      first = index.captures("*.paged.example", page_size: 1)
+      second = index.captures("*.paged.example", page_size: 1, cursor: first.next_cursor)
+
+      assert_equal ["https://paged.example/"], first.map(&:url)
+      assert_equal ["https://assets.paged.example/logo.png"], second.map(&:url)
+      assert_predicate second, :exhausted?
+    end
+  end
+
+  def test_rbcdx_capture_pages_apply_timestamp_and_filters
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "filtered.rbcdx", <<~CDXJ)
+        example,filtered)/a 20250101000000 {"url":"https://filtered.example/a","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,filtered)/b 20250102000000 {"url":"https://filtered.example/b","mime":"text/html","status":"404","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+        example,filtered)/c 20250103000000 {"url":"https://filtered.example/c","mime":"text/html","status":"200","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      index = CDX::Index.open(path)
+
+      page = index.captures(
+        "filtered.example/*",
+        from: "20250102",
+        to: "20250103",
+        filters: {"status" => "200"},
+        page_size: 10
+      )
+
+      assert_equal ["https://filtered.example/c"], page.map(&:url)
+      assert_predicate page, :exhausted?
+    end
+  end
+
+  def test_rbcdx_capture_pages_use_manifests_and_uncovered_fallbacks
+    Dir.mktmpdir do |dir|
+      alpha = repack_rbcdx(dir, "cdx-00000.rbcdx", <<~CDXJ)
+        com,alpha)/ 20240101010101 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      repack_rbcdx(dir, "cdx-00001.rbcdx", <<~CDXJ)
+        com,zeta)/ 20240101010101 {"url":"https://zeta.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      CDX::Backends::RbCDX::Manifest.write([alpha], File.join(dir, CDX::Backends::RbCDX::Manifest::FILENAME))
+      index = CDX::Index.open(dir)
+
+      assert_equal ["https://alpha.com/"], index.captures("alpha.com/*", page_size: 10).map(&:url)
+      assert_equal ["https://zeta.com/"], index.captures("zeta.com/*", page_size: 10).map(&:url)
+    end
+  end
+
+  def test_capture_page_rejects_malformed_and_mismatched_cursors
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+      page = index.captures("paged.example/*", page_size: 1)
+
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, cursor: "not-a-cursor")
+      end
+
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, filters: "=status:404", cursor: page.next_cursor)
+      end
+
+      File.utime(Time.now + 10, Time.now + 10, path)
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, cursor: page.next_cursor)
+      end
+    end
+  end
+
+  def test_capture_page_rejects_checksum_valid_cursor_with_bad_backend_version_or_position
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+      page = index.captures("paged.example/*", page_size: 1)
+
+      refute_respond_to CDX::CaptureCursor, :payload_for
+
+      wrong_version = mutate_cursor(page.next_cursor) do |payload|
+        payload["backend_version"] = 999
+      end
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, cursor: wrong_version)
+      end
+
+      bad_position = mutate_cursor(page.next_cursor) do |payload|
+        payload.fetch("position")["record_index"] = 999
+      end
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, cursor: bad_position)
+      end
+    end
+  end
+
+  def test_capture_page_rejects_cursor_after_path_set_changes
+    Dir.mktmpdir do |dir|
+      repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(dir)
+      page = index.captures("paged.example/*", page_size: 1)
+      repack_rbcdx(dir, "aaa-extra.rbcdx", <<~CDXJ)
+        example,extra)/ 20250101000000 {"url":"https://extra.example/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      CDXJ
+      changed = CDX::Index.open(dir)
+
+      assert_raises(CDX::InvalidCursor) do
+        changed.captures("paged.example/*", page_size: 1, cursor: page.next_cursor)
+      end
+    end
+  end
+
+  def test_capture_pages_reject_unsupported_modes
+    assert_raises(CDX::UnsupportedPageQuery) { @index.captures("commoncrawl.org/*", page_size: 2) }
+    assert_raises(CDX::UnsupportedPageQuery) { @index.captures("commoncrawl.org/*", page_size: 2, sort: :timestamp) }
+    assert_raises(CDX::UnsupportedPageQuery) { @index.captures("commoncrawl.org/*", page_size: 2, closest: "202501") }
+    assert_raises(ArgumentError) { @index.captures("commoncrawl.org/*", limit: 1, page_size: 2) }
+    assert_raises(ArgumentError) { @index.captures("commoncrawl.org/*", page_size: 0) }
+    assert_raises(ArgumentError) { @index.captures("commoncrawl.org/*", page_size: false) }
+    assert_raises(ArgumentError) { @index.captures("commoncrawl.org/*", page_size: "bogus") }
+    assert_raises(ArgumentError) { @index.captures("commoncrawl.org/*", cursor: "not-a-cursor") }
+  end
+
+  def test_capture_pages_require_filter_signature_for_proc_filters
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+      filter = ->(capture) { capture.status == "200" }
+
+      assert_raises(CDX::UnsupportedPageQuery) do
+        index.captures("paged.example/*", page_size: 2, filters: filter)
+      end
+
+      first = index.captures("paged.example/*", page_size: 2, filters: filter, filter_signature: "status-200-v1")
+      second = index.captures("paged.example/*", page_size: 2, filters: filter, filter_signature: "status-200-v1", cursor: first.next_cursor)
+
+      assert_equal ["https://paged.example/page-03", "https://paged.example/page-04"], second.map(&:url)
+    end
+  end
+
   def test_open_accepts_block_form
     count = CDX::Index.open(fixture_path("sample.cdxj")) do |index|
       index.captures("example.com/*").count
@@ -758,6 +960,24 @@ class IndexTest < Minitest::Test
     <<~CDXJ
       com,alpha)/ 20240101010101 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
     CDXJ
+  end
+
+  def paged_repackable_cdxj
+    (1..5).map do |index|
+      path = "page-%02d" % index
+      timestamp = "202501%02d000000" % index
+      offset = index.to_s
+      "example,paged)/#{path} #{timestamp} {\"url\":\"https://paged.example/#{path}\",\"mime\":\"text/html\",\"status\":\"200\",\"length\":\"10\",\"offset\":\"#{offset}\",\"filename\":\"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz\"}\n"
+    end.join
+  end
+
+  def mutate_cursor(cursor)
+    string = cursor.to_s
+    encoded = string.delete_prefix(CDX::CaptureCursor::PREFIX)
+    wrapper = JSON.parse(Base64.urlsafe_decode64(encoded))
+    yield wrapper.fetch("payload")
+    wrapper["checksum"] = CDX::CaptureCursor.digest(wrapper.fetch("payload"))
+    "#{CDX::CaptureCursor::PREFIX}#{Base64.urlsafe_encode64(JSON.generate(wrapper), padding: false)}"
   end
 
   def repack_rbcdx(dir, basename, cdxj)

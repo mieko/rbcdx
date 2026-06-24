@@ -29,6 +29,18 @@ module CDX
         end
       end
 
+      def capture_pages_supported?
+        false
+      end
+
+      def capture_page_backend
+        "cdxj"
+      end
+
+      def capture_page_cursor_version
+        nil
+      end
+
       private
 
       def reader_for(path)

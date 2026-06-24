@@ -17,10 +17,25 @@ module CDX
         def each_capture
           return enum_for(:each_capture) unless block_given?
 
-          blocks.each do |entry|
+          each_capture_with_positions { |capture, _position| yield capture }
+        end
+
+        def each_capture_with_positions(block_index: nil, record_index: nil)
+          return enum_for(:each_capture_with_positions, block_index: block_index, record_index: record_index) unless block_given?
+
+          start_block = normalize_start_block(block_index)
+          blocks.each_with_index do |entry, current_block_index|
+            next if current_block_index < start_block
+
             block = read_hot_block(entry)
+            start_record = (current_block_index == start_block) ? normalize_start_record(record_index, block) : 0
             block.count.times do |index|
-              yield Capture.new(block, index, source_path: path)
+              next if index < start_record
+
+              yield Capture.new(block, index, source_path: path), {
+                "block_index" => current_block_index,
+                "record_index" => index
+              }
             end
           end
         end
@@ -28,18 +43,36 @@ module CDX
         def captures(urlkey, prefix: false, limit: nil)
           return enum_for(:captures, urlkey, prefix: prefix, limit: limit) unless block_given?
 
-          query = urlkey.to_s
           emitted = 0
-          candidate_blocks(query, prefix: prefix).each do |entry|
+          captures_with_positions(urlkey, prefix: prefix) do |capture, _position|
+            yield capture
+            emitted += 1
+            break if limit && emitted >= limit
+          end
+        end
+
+        def captures_with_positions(urlkey, prefix: false, block_index: nil, record_index: nil)
+          return enum_for(:captures_with_positions, urlkey, prefix: prefix, block_index: block_index, record_index: record_index) unless block_given?
+
+          query = urlkey.to_s
+          indexes = candidate_block_indexes(query, prefix: prefix)
+          validate_candidate_start!(indexes, block_index, record_index)
+
+          indexes.each do |current_block_index|
+            next if block_index && current_block_index < block_index
+
+            entry = blocks.fetch(current_block_index)
             block = read_hot_block(entry)
+            start_record = (current_block_index == block_index) ? normalize_start_record(record_index, block) : 0
             block.urlkeys.each_with_index do |candidate, index|
+              next if index < start_record
               next unless prefix ? candidate.start_with?(query) : candidate == query
 
-              yield Capture.new(block, index, source_path: path)
-              emitted += 1
-              break if limit && emitted >= limit
+              yield Capture.new(block, index, source_path: path), {
+                "block_index" => current_block_index,
+                "record_index" => index
+              }
             end
-            break if limit && emitted >= limit
           end
         end
 
@@ -112,7 +145,37 @@ module CDX
           end
         end
 
+        def normalize_start_block(block_index)
+          return 0 if block_index.nil?
+          raise InvalidCursor, "malformed capture cursor position" unless block_index.is_a?(Integer) && block_index >= 0
+          raise InvalidCursor, "capture cursor position is outside this index file" unless block_index < blocks.length
+
+          block_index
+        end
+
+        def normalize_start_record(record_index, block)
+          return 0 if record_index.nil?
+          raise InvalidCursor, "malformed capture cursor position" unless record_index.is_a?(Integer) && record_index >= 0
+          raise InvalidCursor, "capture cursor position is outside this index block" unless record_index < block.count
+
+          record_index
+        end
+
+        def validate_candidate_start!(candidate_indexes, block_index, record_index)
+          return if block_index.nil?
+
+          normalize_start_block(block_index)
+          unless candidate_indexes.include?(block_index)
+            raise InvalidCursor, "capture cursor position is outside this query"
+          end
+          normalize_start_record(record_index, read_hot_block(blocks.fetch(block_index))) unless record_index.nil?
+        end
+
         def candidate_blocks(query, prefix:)
+          candidate_block_indexes(query, prefix: prefix).map { |index| blocks.fetch(index) }
+        end
+
+        def candidate_block_indexes(query, prefix:)
           end_key = prefix ? prefix_successor(query) : nil
           index = [upper_bound(@block_starts, query) - 1, 0].max
           index -= 1 while index.positive? && block_overlaps_query?(blocks[index - 1], query, prefix: prefix, end_key: end_key)
@@ -122,7 +185,7 @@ module CDX
           while index < blocks.length
             block = blocks[index]
             if block_overlaps_query?(block, query, prefix: prefix, end_key: end_key)
-              candidates << block
+              candidates << index
             elsif block_after_query?(block, query, prefix: prefix, end_key: end_key)
               break
             end
