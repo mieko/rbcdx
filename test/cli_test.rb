@@ -14,6 +14,62 @@ class CliTest < Minitest::Test
     assert_equal ["https://example.com/about"], lines.map { |line| line["url"] }
   end
 
+  def test_captures_accepts_named_filter_expression
+    out = StringIO.new
+    status = CDX::CLI.start(
+      ["captures", "--index", fixture_path("sample.cdxj"), "--filter", "html", "commoncrawl.org/*"],
+      out: out,
+      err: StringIO.new
+    )
+
+    assert_equal 0, status
+    lines = out.string.lines.map { |line| JSON.parse(line) }
+    assert_equal [
+      "https://commoncrawl.org/",
+      "https://www.commoncrawl.org/blog/",
+      "https://www.commoncrawl.org/get-started"
+    ], lines.map { |line| line["url"] }
+  end
+
+  def test_captures_can_mix_named_and_field_filter_flags
+    out = StringIO.new
+    status = CDX::CLI.start(
+      ["captures", "--index", fixture_path("sample.cdxj"), "--filter", "html", "--filter", "~url:get-started", "commoncrawl.org/*"],
+      out: out,
+      err: StringIO.new
+    )
+
+    assert_equal 0, status
+    lines = out.string.lines.map { |line| JSON.parse(line) }
+    assert_equal ["https://www.commoncrawl.org/get-started"], lines.map { |line| line["url"] }
+  end
+
+  def test_captures_splits_named_first_mixed_filter_expression
+    out = StringIO.new
+    status = CDX::CLI.start(
+      ["captures", "--index", fixture_path("sample.cdxj"), "--filter", "html,~url:get-started", "commoncrawl.org/*"],
+      out: out,
+      err: StringIO.new
+    )
+
+    assert_equal 0, status
+    lines = out.string.lines.map { |line| JSON.parse(line) }
+    assert_equal ["https://www.commoncrawl.org/get-started"], lines.map { |line| line["url"] }
+  end
+
+  def test_captures_rejects_unknown_named_filter
+    err = StringIO.new
+    status = CDX::CLI.start(
+      ["captures", "--index", fixture_path("sample.cdxj"), "--filter", "extractable-text", "commoncrawl.org/*"],
+      out: StringIO.new,
+      err: err
+    )
+
+    assert_equal 1, status
+    assert_match(/unknown query filter "extractable-text"/, err.string)
+    assert_match(/extractable_text/, err.string)
+  end
+
   def test_count_outputs_count
     out = StringIO.new
     status = CDX::CLI.start(

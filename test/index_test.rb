@@ -46,6 +46,77 @@ class IndexTest < Minitest::Test
     assert_equal ["https://commoncrawl.org/", "https://www.commoncrawl.org/get-started"], captures.map(&:url)
   end
 
+  def test_named_query_filter_symbols_use_shared_capture_filters
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "named.cdxj")
+      File.write(path, named_filter_cdxj)
+      index = CDX::Index.open(path)
+
+      assert_equal [
+        "https://named.example/",
+        "https://named.example/text"
+      ], index.captures("named.example/*", filters: :extractable_text).map(&:url)
+
+      assert_equal [
+        "https://named.example/"
+      ], index.captures("named.example/*", filters: [:status_200, :warc, :html]).map(&:url)
+    end
+  end
+
+  def test_named_query_filters_mix_with_field_filters
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "named.cdxj")
+      File.write(path, named_filter_cdxj)
+      index = CDX::Index.open(path)
+
+      captures = index.captures("named.example/*", filters: ["=status:200", :html]).to_a
+
+      assert_equal ["https://named.example/"], captures.map(&:url)
+    end
+  end
+
+  def test_query_named_filter_rejects_unknown_and_hyphenated_symbols
+    error = assert_raises(ArgumentError) do
+      @index.captures("commoncrawl.org/*", filters: :not_a_filter).first
+    end
+    assert_match(/unknown query filter "not_a_filter"/, error.message)
+    assert_match(/extractable_text/, error.message)
+
+    error = assert_raises(ArgumentError) do
+      @index.captures("commoncrawl.org/*", filters: :"extractable-text").first
+    end
+    assert_match(/unknown query filter "extractable-text"/, error.message)
+  end
+
+  def test_query_strings_remain_field_filters_not_named_filters
+    error = assert_raises(ArgumentError) do
+      @index.captures("commoncrawl.org/*", filters: "extractable_text").first
+    end
+    assert_match(/invalid filter/, error.message)
+
+    error = assert_raises(ArgumentError) do
+      @index.captures("commoncrawl.org/*", filters: "extractable-text").first
+    end
+    assert_match(/invalid filter/, error.message)
+  end
+
+  def test_named_query_filter_signature_uses_canonical_underscore_terms
+    compiled = @index.__send__(:compile_query_filters, [:status_200, :warc])
+    signature = @index.__send__(:stable_filter_signature, compiled, nil)
+
+    assert_equal ["status_200", "warc"], signature.fetch("stable")
+    assert_equal CDX::CaptureFilters::VOCABULARY_VERSION, signature.fetch("named_filter_version")
+
+    terms = CDX::CaptureFilters.parse_expression(
+      "+status_200,+warc,+text_like,-asset_like",
+      label: "query filter"
+    )
+    compiled = @index.__send__(:compile_query_filters, terms)
+    signature = @index.__send__(:stable_filter_signature, compiled, nil)
+
+    assert_equal ["status_200", "warc", "text_like", "-asset_like"], signature.fetch("stable")
+  end
+
   def test_timestamp_range
     captures = @index.captures("commoncrawl.org/*", from: "20251015", to: "20251016").to_a
 
@@ -805,10 +876,44 @@ class IndexTest < Minitest::Test
         index.captures("paged.example/*", page_size: 2, filters: filter)
       end
 
-      first = index.captures("paged.example/*", page_size: 2, filters: filter, filter_signature: "status-200-v1")
-      second = index.captures("paged.example/*", page_size: 2, filters: filter, filter_signature: "status-200-v1", cursor: first.next_cursor)
+      first = index.captures("paged.example/*", page_size: 2, filters: filter, filter_signature: "status_200_v1")
+      second = index.captures("paged.example/*", page_size: 2, filters: filter, filter_signature: "status_200_v1", cursor: first.next_cursor)
 
       assert_equal ["https://paged.example/page-03", "https://paged.example/page-04"], second.map(&:url)
+    end
+  end
+
+  def test_capture_pages_resume_with_stable_named_filter_signature
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      first = index.captures("paged.example/*", page_size: 2, filters: [:status_200, :warc])
+      second = index.captures("paged.example/*", page_size: 3, filters: [:status_200, :warc], cursor: first.next_cursor)
+
+      assert_equal [
+        "https://paged.example/page-03",
+        "https://paged.example/page-04",
+        "https://paged.example/page-05"
+      ], second.map(&:url)
+    end
+  end
+
+  def test_capture_pages_reject_cursor_when_named_filter_signature_changes
+    Dir.mktmpdir do |dir|
+      path = repack_rbcdx(dir, "paged.rbcdx", paged_repackable_cdxj)
+      index = CDX::Index.open(path)
+
+      first = index.captures("paged.example/*", page_size: 1, filters: [:status_200, :warc])
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, filters: [:status_200, :html], cursor: first.next_cursor)
+      end
+
+      negative_terms = CDX::CaptureFilters.parse_expression("-asset_like", label: "query filter")
+      first = index.captures("paged.example/*", page_size: 1, filters: negative_terms)
+      assert_raises(CDX::InvalidCursor) do
+        index.captures("paged.example/*", page_size: 1, filters: :asset_like, cursor: first.next_cursor)
+      end
     end
   end
 
@@ -959,6 +1064,16 @@ class IndexTest < Minitest::Test
   def minimal_repackable_cdxj
     <<~CDXJ
       com,alpha)/ 20240101010101 {"url":"https://alpha.com/","mime":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+    CDXJ
+  end
+
+  def named_filter_cdxj
+    <<~CDXJ
+      example,named)/ 20250101000000 {"url":"https://named.example/","mime":"text/html","mime-detected":"text/html","status":"200","length":"10","offset":"1","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,named)/app.js 20250101000001 {"url":"https://named.example/app.js","mime":"application/javascript","status":"200","length":"10","offset":"2","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,named)/missing 20250101000002 {"url":"https://named.example/missing","mime":"text/html","status":"404","length":"10","offset":"3","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,named)/robots.txt 20250101000003 {"url":"https://named.example/robots.txt","mime":"text/plain","status":"200","length":"10","offset":"4","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/robotstxt/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
+      example,named)/text 20250101000004 {"url":"https://named.example/text","mime":"text/plain","status":"200","length":"10","offset":"5","filename":"crawl-data/CC-MAIN-2025-43/segments/123.45/warc/CC-MAIN-20250101000000-20250101030000-00001.warc.gz"}
     CDXJ
   end
 

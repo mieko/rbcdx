@@ -7,6 +7,15 @@ module CDX
       Backends::RbCDX
     ].freeze
     CURSOR_UNSET = Object.new.freeze
+    QueryFilters = Struct.new(:checks, :stable_terms, :unstable_count, :named_terms, keyword_init: true) do
+      def unstable?
+        unstable_count.positive?
+      end
+
+      def named?
+        named_terms.any?
+      end
+    end
 
     attr_reader :paths
 
@@ -90,8 +99,9 @@ module CDX
 
       page_size = normalize_page_size(page_size)
       matcher = UrlMatcher.new(url, match: match) if url
-      stable_filters = stable_filter_signature(filters, filter_signature)
-      checks = Filter.build(filter_list(filters))
+      compiled_filters = compile_query_filters(filters)
+      stable_filters = stable_filter_signature(compiled_filters, filter_signature)
+      checks = compiled_filters.checks
       query_digest = CaptureCursor.digest(page_query_signature(url, matcher, from, to, stable_filters))
       index_digest = CaptureCursor.digest(@backend.capture_page_fingerprint)
       cursor = cursor.equal?(CURSOR_UNSET) ? nil : CaptureCursor.coerce(cursor)
@@ -125,7 +135,7 @@ module CDX
 
     def run_query(yielder, url:, limit:, from:, to:, filters:, fields:, closest:, match:, sort:)
       matcher = UrlMatcher.new(url, match: match) if url
-      checks = Filter.build(filter_list(filters))
+      checks = compile_query_filters(filters).checks
       limit = normalize_limit(limit)
       sort = validate_sort(sort)
       return if limit&.zero?
@@ -167,25 +177,59 @@ module CDX
       end
     end
 
-    def stable_filter_signature(filters, filter_signature)
-      stable = []
-      unstable = false
+    def compile_query_filters(filters)
+      stable_terms = []
+      checks = []
+      named_terms = []
+      unstable_count = 0
 
       filter_list(filters).each do |filter|
-        term = stable_filter_term(filter)
-        if term
-          stable << term
+        case filter
+        when CaptureFilters::Term
+          checks << CaptureFilters.predicate(filter, label: "query filter")
+          stable_terms << filter.stable_name
+          named_terms << filter.stable_name
+        when Symbol
+          term = CaptureFilters.symbol_term(filter, label: "query filter")
+          checks << CaptureFilters.predicate(term, label: "query filter")
+          stable_terms << term.stable_name
+          named_terms << term.stable_name
+        when Filter
+          checks << filter
+          term = stable_filter_term(filter)
+          term ? stable_terms << term : unstable_count += 1
+        when String
+          parsed = Filter.parse(filter)
+          checks << parsed
+          stable_terms << stable_filter_term(parsed)
+        when Hash
+          checks.concat(Filter.build([filter]))
+          term = stable_hash_filter_term(filter)
+          term ? stable_terms << term : unstable_count += 1
+        when Proc
+          checks << filter
+          unstable_count += 1
         else
-          unstable = true
+          raise ArgumentError, "unsupported filter: #{filter.inspect}"
         end
       end
 
-      if unstable && filter_signature.nil?
+      QueryFilters.new(
+        checks: checks,
+        stable_terms: stable_terms.compact,
+        unstable_count: unstable_count,
+        named_terms: named_terms
+      )
+    end
+
+    def stable_filter_signature(compiled_filters, filter_signature)
+      if compiled_filters.unstable? && filter_signature.nil?
         raise UnsupportedPageQuery, "filter_signature is required for Proc or custom filters in cursor pages"
       end
 
-      signature = {"stable" => stable}
-      signature["unstable_count"] = filter_list(filters).length - stable.length
+      signature = {"stable" => compiled_filters.stable_terms}
+      signature["named_filter_version"] = CaptureFilters::VOCABULARY_VERSION if compiled_filters.named?
+      signature["unstable_count"] = compiled_filters.unstable_count
       signature["custom"] = CaptureCursor.canonical_value(filter_signature) unless filter_signature.nil?
       signature
     end
@@ -195,27 +239,20 @@ module CDX
       when Filter
         expression = stable_filter_value(filter.expression)
         return unless expression
-
         {"type" => "filter", "field" => filter.field, "modifier" => filter.modifier, "expression" => expression}
-      when String
-        stable_filter_term(Filter.parse(filter))
-      when Hash
-        entries = []
-        filter.each do |field, expected|
-          value = stable_filter_value(expected)
-          unless value
-            entries = nil
-            break
-          end
-
-          entries << [field.to_s, value]
-        end
-        return unless entries
-
-        {"type" => "hash", "entries" => entries.sort_by(&:first)}
-      when Proc
-        nil
       end
+    end
+
+    def stable_hash_filter_term(filter)
+      entries = []
+      filter.each do |field, expected|
+        value = stable_filter_value(expected)
+        return unless value
+
+        entries << [field.to_s, value]
+      end
+
+      {"type" => "hash", "entries" => entries.sort_by(&:first)}
     end
 
     def stable_filter_value(value)

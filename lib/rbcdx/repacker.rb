@@ -276,7 +276,7 @@ module CDX
       @writer_class = self.class.writers.fetch(@output_format) do
         raise ArgumentError, "unsupported output format: #{output_format.inspect}"
       end
-      @filter_signature = filter_signature || inferred_filter_signature(filters, where)
+      @filter_signature = filter_signature || inferred_filter_signature(filters, where, filter_registry)
       @filters = RepackFilters.build(filters, registry: filter_registry, where: where)
       @force = force
       @progress = progress
@@ -344,8 +344,8 @@ module CDX
 
     private
 
-    def inferred_filter_signature(filters, where)
-      RepackFilters.stable_signature(filters: filters, where: where)
+    def inferred_filter_signature(filters, where, filter_registry)
+      RepackFilters.stable_signature(filters: filters, where: where, registry: filter_registry)
     rescue ArgumentError
       nil
     end

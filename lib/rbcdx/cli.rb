@@ -293,8 +293,8 @@ module CDX
         opts.on("--closest TIMESTAMP", "Sort by closeness to a CDX timestamp") do |timestamp|
           options[:closest] = timestamp
         end
-        opts.on("--filter FILTER", "pywb-style filter, for example '=status:200'") do |filter|
-          options[:filters] << filter
+        opts.on("--filter FILTER", "CDX field filter or named filter expression") do |filter|
+          options[:filters].concat(query_filter_terms(filter))
         end
         opts.on("--fields FIELDS", "Comma-separated fields for jsonl/csv output") do |fields|
           options[:fields] = fields
@@ -408,8 +408,8 @@ module CDX
         opts.on("--zstd-level N", Integer, "Zstandard compression level") do |zstd_level|
           options[:zstd_level] = zstd_level
         end
-        opts.on("--filter EXPR", "Filter expression, for example '+status-200,-warc'") do |filter|
-          options[:filters] << filter
+        opts.on("--filter EXPR", "Filter expression, for example '+status_200,-asset_like'") do |filter|
+          options[:filters].concat(repack_filter_terms(filter))
         end
         opts.on("--where FILTER", "CDX field filter, for example '=status:200'") do |filter|
           options[:where] << filter
@@ -467,6 +467,37 @@ module CDX
       raise ArgumentError, "provide at least one --index path" if options[:indexes].empty?
 
       CDX::Index.open(options[:indexes])
+    end
+
+    def query_filter_terms(filter)
+      if filter.include?(",") && filter.include?(":")
+        parts = split_filter_expression(filter)
+        if query_named_filter_expression?(parts.first)
+          return parts.flat_map { |part| part.include?(":") ? part : CaptureFilters.parse_expression(part, label: "query filter") }
+        end
+      end
+
+      return [filter] if filter.include?(":")
+
+      CaptureFilters.parse_expression(filter, label: "query filter")
+    end
+
+    def repack_filter_terms(filter)
+      CaptureFilters.parse_expression(filter, label: "repack filter")
+    end
+
+    def split_filter_expression(filter)
+      filter.to_s.split(",").map(&:strip).reject(&:empty?)
+    end
+
+    def query_named_filter_expression?(filter)
+      return false unless filter
+      return false if filter.include?(":")
+
+      CaptureFilters.parse_expression(filter, label: "query filter")
+      true
+    rescue ArgumentError
+      false
     end
 
     def query_options(options)
@@ -584,7 +615,7 @@ module CDX
       options[:max_records] = log_options["max_records"] if log_options.key?("max_records")
       options[:restart_interval] = log_options["restart_interval"] if log_options.key?("restart_interval")
       options[:zstd_level] = log_options["zstd_level"] if log_options.key?("zstd_level")
-      options[:filters] = filters
+      options[:filters] = filters.flat_map { |filter| repack_filter_terms(filter) }
       options[:where] = where
       options[:delete_when_processed] = delete_when_processed
       options[:manifest] = manifest
@@ -653,7 +684,7 @@ module CDX
         "max_records" => options[:max_records],
         "restart_interval" => options[:restart_interval],
         "zstd_level" => options[:zstd_level],
-        "filters" => options.fetch(:filters),
+        "filters" => CaptureFilters.stable_terms(options.fetch(:filters), label: "repack filter"),
         "where" => options.fetch(:where),
         "delete_when_processed" => options.fetch(:delete_when_processed, false),
         "manifest" => options.fetch(:manifest, true)
@@ -704,7 +735,7 @@ module CDX
           --max-records N         Maximum records per compressed block (rbcdx)
           --restart-interval N    Front-coded string restart interval (rbcdx)
           --zstd-level N          Zstandard compression level (rbcdx)
-          --filter EXPR           Filter expression, for example '+status-200,-warc'
+          --filter EXPR           Filter expression, for example '+status_200,-asset_like'
           --where FILTER          CDX field filter, for example '=status:200'
           --resume                Resume a batch repack
           --force                 Overwrite outputs and batch state

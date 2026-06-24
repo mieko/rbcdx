@@ -216,6 +216,10 @@ class RepackerTest < Minitest::Test
 
       assert_equal 1, result.record_count
       assert_equal ["https://example.com/about"], CDX::Index.open(output).map(&:url)
+      assert_equal(
+        {"filters" => ["about"], "where" => []},
+        CDX::Repacker.read_header(output).fetch("repack").fetch("filter_signature")
+      )
     end
   end
 
@@ -246,9 +250,17 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "extractable.rbcdx")
       File.write(input, extractable_text_cdxj)
 
-      result = CDX::Repacker.repack(input, output, filters: ["extractable-text"])
+      result = CDX::Repacker.repack(input, output, filters: ["extractable_text"])
 
       assert_equal 7, result.record_count
+      assert_equal(
+        {
+          "filters" => ["extractable_text"],
+          "named_filter_version" => CDX::CaptureFilters::VOCABULARY_VERSION,
+          "where" => []
+        },
+        CDX::Repacker.read_header(output).fetch("repack").fetch("filter_signature")
+      )
       assert_equal [
         "https://example.com/",
         "https://example.com/about.txt",
@@ -267,7 +279,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "extractable.rbcdx")
       File.write(input, extractable_text_cdxj)
 
-      result = CDX::Repacker.repack(input, output, filters: ["+status-200,+warc,+text-like,-asset-like,-site-metadata"])
+      result = CDX::Repacker.repack(input, output, filters: ["+status_200,+warc,+text_like,-asset_like,-site_metadata"])
 
       assert_equal 7, result.record_count
       assert_equal [
@@ -379,7 +391,7 @@ class RepackerTest < Minitest::Test
       out = StringIO.new
       err = StringIO.new
 
-      status = CDX::CLI.start(["repack", "--output", output, "--filter", "status-200", "--dry-run", input], out: out, err: err)
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "status_200", "--dry-run", input], out: out, err: err)
 
       assert_equal 0, status
       assert_match(/would create \[1\/1\] #{Regexp.escape(output)} from #{Regexp.escape(input)}/, out.string)
@@ -399,7 +411,7 @@ class RepackerTest < Minitest::Test
       out = StringIO.new
       err = StringIO.new
 
-      status = CDX::CLI.start(["repack", "--output", output, "--filter", "extractable-text", "--dry-run", input], out: out, err: err)
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "extractable_text", "--dry-run", input], out: out, err: err)
 
       assert_equal 1, status
       assert_empty out.string
@@ -434,7 +446,7 @@ class RepackerTest < Minitest::Test
       out = StringIO.new
       err = StringIO.new
 
-      status = CDX::CLI.start(["repack", "--output", output, "--filter", "status-200", input], out: out, err: err)
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "status_200", input], out: out, err: err)
 
       assert_equal 0, status
       assert_match(/processing \[1\/1\]/, err.string)
@@ -451,7 +463,7 @@ class RepackerTest < Minitest::Test
       out = StringIO.new
       err = StringIO.new
 
-      status = CDX::CLI.start(["repack", "--output", output, "--filter", "+status-200,+html,-warc", input], out: out, err: err)
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "+status_200,+html,-warc", input], out: out, err: err)
 
       assert_equal 0, status
       assert_match(/processing \[1\/1\]/, err.string)
@@ -473,6 +485,20 @@ class RepackerTest < Minitest::Test
       assert_equal 1, status
       assert_empty out.string
       assert_match(/unknown repack filter "missing"/, err.string)
+    end
+  end
+
+  def test_cli_repack_rejects_hyphenated_filter_names
+    Dir.mktmpdir do |dir|
+      input = File.join(dir, "sample.cdxj")
+      output = File.join(dir, "sample.rbcdx")
+      File.write(input, sorted_cdxj)
+      err = StringIO.new
+
+      status = CDX::CLI.start(["repack", "--output", output, "--filter", "status-200", input], out: StringIO.new, err: err)
+
+      assert_equal 1, status
+      assert_match(/unknown repack filter "status-200"/, err.string)
     end
   end
 
@@ -708,7 +734,7 @@ class RepackerTest < Minitest::Test
       results = CDX::Repacker.repack_many(
         [input],
         output_dir: output_dir,
-        filters: ["status-200"],
+        filters: ["status_200"],
         dry_run: true
       )
 
@@ -1150,7 +1176,7 @@ class RepackerTest < Minitest::Test
 
         with_singleton_replacement(CDX::Repacker, :repack, replacement_repack) do
           first_err = StringIO.new
-          status = CDX::CLI.start(["repack", "--output-dir", output_dir, "--filter", "status-200", input], out: StringIO.new, err: first_err)
+          status = CDX::CLI.start(["repack", "--output-dir", output_dir, "--filter", "status_200", input], out: StringIO.new, err: first_err)
 
           assert_equal 1, status
           assert_includes first_err.string, "created resume log #{real_log_path}"
@@ -1165,7 +1191,7 @@ class RepackerTest < Minitest::Test
         assert_equal "rbcdx-repack-log", log.fetch("format")
         assert_equal [input], log.fetch("request").fetch("inputs")
         assert_equal output_dir, log.fetch("request").fetch("options").fetch("output_dir")
-        assert_equal ["status-200"], log.fetch("request").fetch("options").fetch("filters")
+        assert_equal ["status_200"], log.fetch("request").fetch("options").fetch("filters")
 
         out = StringIO.new
         err = StringIO.new
@@ -1349,7 +1375,7 @@ class RepackerTest < Minitest::Test
       output_dir = File.join(dir, "packed")
       log_path = File.join(dir, CDX::CLI::REPACK_LOG_FILENAME)
       File.write(input, sorted_cdxj)
-      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir, filters: ["status-200"])
+      write_cli_repack_log(log_path, inputs: [input], output_dir: output_dir, filters: ["status_200"])
       out = StringIO.new
       err = StringIO.new
       previous = Dir.pwd
@@ -1607,7 +1633,7 @@ class RepackerTest < Minitest::Test
       lines = sorted_cdxj.lines
       File.write(input, sorted_cdxj)
 
-      result = CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status-200"])
+      result = CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status_200"])
 
       assert_equal 2, result.record_count
       assert_equal "cdxj", result.output_format
@@ -1621,7 +1647,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "anything.rbcdx")
       File.write(input, sorted_cdxj)
 
-      CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status-200"])
+      CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status_200"])
 
       refute_equal CDX::Backends::RbCDX::Format::MAGIC, File.binread(output, CDX::Backends::RbCDX::Format::MAGIC.bytesize)
       assert_match(/\Acom,example\)\/about 20240202020202 /, File.read(output))
@@ -1649,7 +1675,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "weird.name.gz")
       File.write(input, sorted_cdxj)
 
-      CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status-200"])
+      CDX::Repacker.repack(input, output, output_format: "cdxj", filters: ["status_200"])
 
       assert_equal sorted_cdxj.lines[1..2].join, gzip_read(output)
     end
@@ -1685,7 +1711,7 @@ class RepackerTest < Minitest::Test
       input = File.join(input_dir, "sample.cdxj")
       File.write(input, sorted_cdxj)
 
-      results = CDX::Repacker.repack_many([input], output_dir: output_dir, output_format: "cdxj", filters: ["status-200"])
+      results = CDX::Repacker.repack_many([input], output_dir: output_dir, output_format: "cdxj", filters: ["status_200"])
 
       assert_equal [:written], results.map(&:status)
       assert File.file?(File.join(output_dir, "sample.cdxj"))
@@ -1699,7 +1725,7 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "sample.filtered.cdxj")
       File.write(input, sorted_cdxj)
 
-      results = CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status-200"])
+      results = CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status_200"])
 
       assert_equal [:written], results.map(&:status)
       assert File.file?(output)
@@ -1733,8 +1759,8 @@ class RepackerTest < Minitest::Test
       input = File.join(dir, "sample.cdxj")
       File.write(input, sorted_cdxj)
 
-      CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status-200"])
-      results = CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status-200"], resume: true)
+      CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status_200"])
+      results = CDX::Repacker.repack_many([input], output_dir: dir, output_format: "cdxj", filters: ["status_200"], resume: true)
 
       assert_equal [:skipped], results.map(&:status)
     end
@@ -1746,8 +1772,8 @@ class RepackerTest < Minitest::Test
       output = File.join(dir, "sample.filtered.cdxj")
       File.write(input, sorted_cdxj)
 
-      CDX::Repacker.repack_many([dir], output_dir: dir, output_format: "cdxj", filters: ["status-200"], delete_when_processed: true)
-      results = CDX::Repacker.repack_many([dir], output_dir: dir, output_format: "cdxj", filters: ["status-200"], delete_when_processed: true, resume: true)
+      CDX::Repacker.repack_many([dir], output_dir: dir, output_format: "cdxj", filters: ["status_200"], delete_when_processed: true)
+      results = CDX::Repacker.repack_many([dir], output_dir: dir, output_format: "cdxj", filters: ["status_200"], delete_when_processed: true, resume: true)
 
       assert_equal [:skipped], results.map(&:status)
       refute File.exist?(input)
@@ -1765,8 +1791,8 @@ class RepackerTest < Minitest::Test
       output = File.join(output_dir, "sample.cdxj")
       File.write(input, sorted_cdxj)
 
-      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, output_format: "cdxj", filters: ["status-200"])
-      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir, output_format: "cdxj", filters: ["status-200"], resume: true)
+      CDX::Repacker.repack_many([input_dir], output_dir: output_dir, output_format: "cdxj", filters: ["status_200"])
+      results = CDX::Repacker.repack_many([input_dir], output_dir: output_dir, output_format: "cdxj", filters: ["status_200"], resume: true)
 
       assert_equal [:skipped], results.map(&:status)
       assert File.file?(input)
@@ -1796,7 +1822,7 @@ class RepackerTest < Minitest::Test
       out = StringIO.new
       err = StringIO.new
 
-      status = CDX::CLI.start(["repack", "--output-format", "cdxj", "--output", output, "--filter", "status-200", input], out: out, err: err)
+      status = CDX::CLI.start(["repack", "--output-format", "cdxj", "--output", output, "--filter", "status_200", input], out: out, err: err)
 
       assert_equal 0, status
       assert_equal "#{output}\n", out.string
