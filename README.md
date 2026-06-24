@@ -135,6 +135,47 @@ When a Common Crawl `cluster.idx` file is in the directory with `cdx-*.gz`
 shards, rbcdx uses it automatically to avoid scanning unrelated CDXJ blocks for
 URL-pattern queries.
 
+## Cursor Pages
+
+For durable, bounded work queues over packed `.rbcdx` indexes, pass
+`page_size:` to `captures`. Page mode returns a materialized `CDX::CapturePage`:
+the captures, `next_cursor`, and `exhausted?` state are known before the method
+returns.
+
+```ruby
+cursor = saved_cursor
+
+loop do
+  page = index.captures(
+    "example.com/news/*",
+    filters: "=status:200",
+    page_size: 500,
+    cursor: cursor
+  )
+
+  page.each { |capture| process(capture) }
+
+  break if page.exhausted?
+  cursor = page.next_cursor
+  save_cursor(cursor.to_s)
+end
+```
+
+`CDX::CapturePage` includes `Enumerable`, so captures are still consumed with
+`each`, `map`, and other normal collection helpers. `page.next_cursor` is a
+`CDX::CaptureCursor`; store `page.next_cursor.to_s` when you need a
+JSON/database-friendly value, and pass either the cursor object or serialized
+string back as `cursor:`.
+
+Only persist `page.next_cursor` after successfully processing the whole page. If
+you stop early and save the cursor, the next run may skip captures that were
+returned in the page but not processed.
+
+Cursor pages are returned in native index order. They currently support packed
+`.rbcdx` indexes only; CDX/CDXJ, gzip, `sort:`, and `closest:` are not resumable
+yet. Procs or other unstable filters require `filter_signature:` so rbcdx can
+tell whether a saved cursor belongs to the same logical query.
+
 ## Capture Objects
 
 `CDX::Capture` exposes common fields as methods:
