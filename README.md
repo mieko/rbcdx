@@ -155,6 +155,7 @@ index.captures("commoncrawl.org/*", fields: %w[url status]).map(&:to_h)
 WARC records with your HTTP client:
 
 ```ruby
+index = CDX::Index.open("./indexes/CC-MAIN-2026-25")
 archive = CDX::HTTP::RemoteArchive.new(index)
 request = archive.requests("reddit.com/", closest: "202606").first
 
