@@ -217,34 +217,108 @@ Exact size and speed gains depend on the crawl and filters you choose.
 Use `rbcdx repack` to convert sorted CDXJ files into `.rbcdx` files:
 
 ```sh
+cd ./indexes/CC-MAIN-2026-25
+rbcdx repack
+```
+
+By default, batch repack uses the current directory as both input and output.
+You can also name the input and output directories explicitly:
+
+```sh
 rbcdx repack --output-dir ./rbcdx-indexes ./indexes/CC-MAIN-2026-25
 ```
 
-Use a separate output directory. A directory containing both `cdx-*.gz` and
-`.rbcdx` files is rejected because `CDX::Index` treats a local index directory
-as one backend format at a time.
+Non-dry-run repacks write progress and resume instructions to stderr. Successful
+output paths are written to stdout, one per line, so scripts can consume them.
 
-Batch repack writes `rbcdx-repack-state.json`, so interrupted work can resume:
+Use `--dry-run` to preview a repack without writing files:
 
 ```sh
-rbcdx repack --output-dir ./rbcdx-indexes --resume ./indexes/CC-MAIN-2026-25
+rbcdx repack --filter extractable-text --dry-run
 ```
+
+Dry runs print the output file each input would create. With
+`--delete-when-processed`, they also print the source file that would be deleted
+after the output is written. They stream each input once to report filter
+selectivity, for example `2 of 3 records passed filters`, but they do not sort,
+compress, write packed files, update state, or delete sources.
+
+`CDX::Index` treats a local index directory as one backend format at a time, so
+a directory containing both `cdx-*.gz` and `.rbcdx` files should be treated as a
+migration workspace, not as a queryable index.
+
+Batch repack writes a resume log in the directory where you ran the command, so
+interrupted work can continue without repeating the original arguments:
+
+```sh
+rbcdx repack --resume
+```
+
+The log records the original input paths, output directory, filters, and format.
+It is removed after a successful batch.
 
 If disk space is tight, `--delete-when-processed` deletes each source shard only
-after its packed output has been written, verified, and recorded:
+after its output has been written, atomically published, and recorded:
 
 ```sh
-rbcdx repack --output-dir ./rbcdx-indexes --delete-when-processed ./indexes/CC-MAIN-2026-25
+rbcdx repack --delete-when-processed
 ```
+
+Once all source shards have been deleted, the directory can be opened normally
+as packed rbcdx indexes.
+
+`rbcdx` is the default output format. You can also keep CDXJ output and use
+repack as a streaming filter:
+
+```sh
+rbcdx repack --output-format cdxj --filter extractable-text --output-dir ./filtered ./indexes/CC-MAIN-2026-25
+```
+
+In CDXJ mode, `--output-format` controls the record format. For single-file
+outputs, `.gz` controls only CDXJ compression. Batch output preserves input
+basenames when writing to a different directory; when writing beside the source
+file, rbcdx inserts `.filtered` so it does not overwrite the input.
 
 Repacking can also filter records. Named repack filters are useful presets:
 
 ```sh
-rbcdx repack --output-dir ./rbcdx-html --filter +status-200,+html,-warc ./indexes/CC-MAIN-2026-25
+rbcdx repack --filter extractable-text
 ```
 
-Built-in named filters are `status-200`, `html`, and `warc`. Use `+name` to
-require a named filter and `-name` to exclude records matching a named filter.
+`extractable-text` keeps normal WARC-backed `200` captures whose MIME type
+looks text-extractable, while dropping obvious assets and site metadata such as
+images, scripts, stylesheets, fonts, PDFs, `robots.txt`, sitemaps, and web
+manifests.
+
+Built-in named filters are:
+
+| Filter | Keeps records that... |
+| --- | --- |
+| `status-200` | have CDX status `200` |
+| `warc` | point at a normal `/warc/` object |
+| `html` | have `text/html` in `mime` or `mime-detected` |
+| `text-like` | are plain text, Markdown, HTML, XHTML, RSS/Atom/RDF, or generic XML documents |
+| `asset-like` | look like static assets by MIME type or URL extension |
+| `site-metadata` | look like `robots.txt`, sitemaps, manifests, or `.well-known` metadata |
+| `extractable-text` | combine `status-200`, `warc`, `text-like`, `-asset-like`, and `-site-metadata` |
+
+`text-like` accepts `text/plain`, Markdown MIME types, `text/html`, `text/xml`,
+`application/xml`, `application/xhtml+xml`, and RSS/Atom/RDF XML MIME types.
+It intentionally does not treat every `+xml` MIME type as text content, because
+Common Crawl includes XML-backed playlists, map files, and media descriptors.
+`asset-like` rejects images, audio, video, fonts, CSS, JavaScript, PDFs, and
+common static-file extensions such as `.jpg`, `.png`, `.gif`, `.svg`, `.css`,
+`.js`, `.woff2`, `.mp4`, and `.zip`.
+`site-metadata` treats sitemap-looking XML files as metadata, including names
+that contain `sitemap` and either end in `.xml`/`.xml.gz` or have an XML-ish
+reported or detected MIME type.
+
+Use `+name` to require a named filter and `-name` to exclude records matching a
+named filter. For example, this is equivalent to the preset above:
+
+```sh
+rbcdx repack --filter +status-200,+warc,+text-like,-asset-like,-site-metadata
+```
 
 Use `--where` for normal CDX field filters:
 
@@ -256,6 +330,7 @@ Single-file output is available when you want exact control:
 
 ```sh
 rbcdx repack --output ./rbcdx-indexes/cdx-00000.rbcdx ./indexes/CC-MAIN-2026-25/cdx-00000.gz
+rbcdx repack --output-format cdxj --output ./filtered/cdx-00000.gz ./indexes/CC-MAIN-2026-25/cdx-00000.gz
 ```
 
 `--force` is required to overwrite an existing output.
